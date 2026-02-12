@@ -65,7 +65,8 @@ def to_unix_timestamp(df: pd.DataFrame, column: str = "timestamp") -> pd.DataFra
     if column not in df.columns or df.empty:
         return df
     if pd.api.types.is_datetime64_any_dtype(df[column]):
-        df[column] = df[column].view("int64") // 1_000_000_000
+        # pandas 2.x removed Series.view for datetime; use astype instead
+        df[column] = df[column].astype("int64") // 1_000_000_000
     else:
         df[column] = pd.to_numeric(df[column], errors="coerce")
     return df

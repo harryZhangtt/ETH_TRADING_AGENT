@@ -26,3 +26,11 @@ class PipelineConfig:
     google_trend_max_retries: int = 5
     google_trend_backoff_seconds: float = 5.0
     debug: bool = False
+
+    # Twitter / social metrics (optional)
+    twitter_bearer_token: Optional[str] = None
+    twitter_search_url: str = "https://api.twitter.com/2/tweets/counts/recent"
+    twitter_query: str = "ethereum OR eth -is:retweet"
+
+    # BTC hashrate (optional)
+    btc_hashrate_url: str = "https://api.blockchain.info/charts/hash-rate?timespan=all&format=csv"

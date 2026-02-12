@@ -86,7 +86,8 @@ def _get_eth_daily_transaction(
         _dbg("[DEBUG] eth_daily_tx empty response body")
         return pd.Series(dtype="float64")
 
-    _dbg(f"[DEBUG] eth_daily_tx raw snippet: {text[:200].replace('\\n', ' ')}")
+    raw_snippet = text[:200].replace("\n", " ")
+    _dbg(f"[DEBUG] eth_daily_tx raw snippet: {raw_snippet}")
 
     try:
         df = pd.read_csv(io.StringIO(text))
