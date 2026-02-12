@@ -7,7 +7,7 @@ from metrics import PipelineConfig,build_universal_metrics
 def main() -> None:
     pipeline_config = PipelineConfig(etherscan_api_key="7K814DY5AXIQCHEH9VKWBBIP1AAMHU2VIS", debug=False)
 
-    # metrics_df = build_universal_metrics(start="2015-08-08", end="2026-02-11", caller="main", config=pipeline_config, save=True)
+    metrics_df = build_universal_metrics(start="2015-08-08", end="2026-02-11", caller="main", config=pipeline_config, save=True)
 
 
 

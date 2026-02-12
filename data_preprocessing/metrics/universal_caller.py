@@ -12,7 +12,7 @@ try:
     from .eth_daily_txn import fetch_eth_daily_txn
     from .google_trend import fetch_google_trend
     from .ohlc_volume import fetch_eth_ohlc_volume
-    from .supply import fetch_eth_supply_daily
+    from .supply import fetch_eth_supply_growth
 except ImportError:  # Allow running as a script without package context.
     import sys
     from pathlib import Path
@@ -79,14 +79,14 @@ def build_universal_metrics(
     if eth_ohlc.empty:
         return _empty_output()
 
-    supply_daily_df = fetch_eth_supply_daily(
+    supply_daily_df = fetch_eth_supply_growth(
         start=start_ts,
         end=end_ts,
         config=config,
         save=save,
         as_unix=False,
     )
-    if supply_daily_df.empty:
+    if supply_daily_df.empty or "supply" not in supply_daily_df.columns:
         supply_series = pd.Series(dtype="float64")
     else:
         supply_series = supply_daily_df.set_index("timestamp")["supply"]

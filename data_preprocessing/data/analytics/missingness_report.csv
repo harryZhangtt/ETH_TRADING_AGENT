@@ -7,10 +7,10 @@ Open,0.0,0
 close,0.0,0
 volume,0.0,0
 timestamp,0.0,0
-supply,0.0,0
+supply,1.0,85136
 eth_daily_tx,0.0,0
 google_trend,0.0,0
-market_cap,0.0,0
+market_cap,1.0,85136
 btc_open,0.0,0
 btc_high,0.0,0
 btc_low,0.0,0

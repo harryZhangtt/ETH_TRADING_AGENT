@@ -164,8 +164,7 @@ def _filter_range(df: pd.DataFrame, start_ts: pd.Timestamp, end_ts: pd.Timestamp
 
 
 if __name__ == "__main__":
-    config = PipelineConfig(debug=True)
-    daily = fetch_eth_supply_daily(period="30d", config=config)
-    print(daily.head())
-    growth = fetch_eth_supply_growth(period="365d", config=config)
-    print(growth.head())
+    cfg = PipelineConfig(debug=True)
+    print(fetch_eth_supply_daily(period="30d", config=cfg).head())
+    print(fetch_eth_supply_growth(period="365d", config=cfg).head())
+
