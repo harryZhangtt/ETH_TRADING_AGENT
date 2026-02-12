@@ -1,4 +1,11 @@
+from metrics import PipelineConfig, build_universal_metrics
 
-from data_preprocessing.marketCap import get_eth_hourly_ohlc, get_eth_hourly_ohlcet_et
 
-df = get_eth_hourly_ohlc(start="2024-01-01", end="2024-03-01")
+def main() -> None:
+    config = PipelineConfig(etherscan_api_key="7K814DY5AXIQCHEH9VKWBBIP1AAMHU2VIS")
+    df = build_universal_metrics(period="30d", caller="main", config=config, save=True)
+    print(df.head())
+
+
+if __name__ == "__main__":
+    main()
