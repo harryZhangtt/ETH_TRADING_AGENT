@@ -9,7 +9,7 @@ def main() -> None:
 
 
     ##2015-08-08
-    metrics_df = build_universal_metrics(start="2026-02-08", end="2026-02-11", caller="main", config=pipeline_config, save=True)
+    metrics_df = build_universal_metrics(start="2015-08-08", end="2026-02-11", caller="main", config=pipeline_config, save=True)
 
 
 

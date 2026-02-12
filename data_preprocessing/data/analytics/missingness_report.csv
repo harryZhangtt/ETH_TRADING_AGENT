@@ -16,6 +16,6 @@ btc_high,0.0,0
 btc_low,0.0,0
 btc_close,0.0,0
 btc_volume,0.0,0
-eth_rolling_beta,0.3333333333333333,24
-eth_return,0.013888888888888888,1
-btc_return,0.013888888888888888,1
+eth_rolling_beta,0.00028190189813944745,24
+eth_return,1.1745912422476978e-05,1
+btc_return,1.1745912422476978e-05,1

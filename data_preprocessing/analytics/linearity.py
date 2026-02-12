@@ -5,7 +5,23 @@ import pandas as pd
 
 
 def correlation_matrix(df: pd.DataFrame, method: str = "pearson") -> pd.DataFrame:
-    return df.corr(method=method)
+    if df.empty:
+        return pd.DataFrame()
+
+    numeric = df.select_dtypes(include=[np.number])
+    if numeric.empty:
+        return pd.DataFrame()
+
+    corr = numeric.corr(method=method)
+    std = numeric.std(skipna=True)
+    invalid = std[(std == 0) | (std.isna())].index.tolist()
+    if invalid:
+        for col in invalid:
+            if col in corr.columns:
+                corr.loc[col, :] = 0.0
+                corr.loc[:, col] = 0.0
+                corr.loc[col, col] = 1.0
+    return corr
 
 
 def vif_scores(df: pd.DataFrame) -> pd.DataFrame:

@@ -1,5 +1,5 @@
 {
-  "rows": 72,
+  "rows": 85136,
   "features": [
     "low",
     "high",
@@ -19,5 +19,5 @@
     "eth_return",
     "btc_return"
   ],
-  "pca_components_used": 6
+  "pca_components_used": 7
 }
