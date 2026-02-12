@@ -8,14 +8,16 @@
     "volume",
     "supply",
     "eth_daily_tx",
+    "google_trend",
     "market_cap",
     "btc_open",
     "btc_high",
     "btc_low",
     "btc_close",
     "btc_volume",
+    "eth_rolling_beta",
     "eth_return",
     "btc_return"
   ],
-  "pca_components_used": 5
+  "pca_components_used": 6
 }
