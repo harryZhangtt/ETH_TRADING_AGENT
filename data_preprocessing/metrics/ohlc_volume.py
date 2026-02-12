@@ -6,6 +6,7 @@ from .common.coinbase_client import fetch_coinbase_candles, format_ohlc_frame
 from .common.config import PipelineConfig
 from .common.io_utils import maybe_save_csv
 from .common.time_utils import resolve_time_range
+from .common.transforms import to_unix_timestamp
 
 
 def fetch_eth_ohlc_volume(
@@ -15,6 +16,7 @@ def fetch_eth_ohlc_volume(
     caller: Optional[str] = None,
     config: PipelineConfig = PipelineConfig(),
     save: bool = True,
+    as_unix: bool = True,
 ) -> pd.DataFrame:
     if start is not None and period is not None:
         raise ValueError("Use either start/end or period, not both.")
@@ -34,5 +36,9 @@ def fetch_eth_ohlc_volume(
     else:
         df = format_ohlc_frame(raw, config.eth_product_id, caller)
 
-    maybe_save_csv(df, config.output_dir, "eth_ohlc_volume.csv", enabled=save)
-    return df
+    output = df.copy()
+    if as_unix:
+        output = to_unix_timestamp(output, "timestamp")
+
+    maybe_save_csv(output, config.output_dir, "eth_ohlc_volume.csv", enabled=save)
+    return output

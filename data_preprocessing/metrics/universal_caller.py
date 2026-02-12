@@ -2,14 +2,32 @@ from typing import Optional, Union
 
 import pandas as pd
 
-from .btc_price_info import fetch_btc_price_info
-from .common.config import PipelineConfig
-from .common.io_utils import maybe_save_csv
-from .common.time_utils import resolve_time_range
-from .common.transforms import attach_daily_metric, build_daily_series, null_value_check
-from .eth_daily_txn import fetch_eth_daily_txn
-from .ohlc_volume import fetch_eth_ohlc_volume
-from .supply import fetch_eth_supply_daily
+try:
+    from .btc_price_info import fetch_btc_price_info
+    from .common.config import PipelineConfig
+    from .common.io_utils import maybe_save_csv
+    from .common.time_utils import resolve_time_range
+    from .common.transforms import attach_daily_metric, null_value_check, to_unix_timestamp
+    from .eth_daily_txn import fetch_eth_daily_txn
+    from .ohlc_volume import fetch_eth_ohlc_volume
+    from .supply import fetch_eth_supply_daily
+except ImportError:  # Allow running as a script without package context.
+    import sys
+    from pathlib import Path
+
+    sys.path.append(str(Path(__file__).resolve().parents[2]))
+    from data_preprocessing.metrics.btc_price_info import fetch_btc_price_info
+    from data_preprocessing.metrics.common.config import PipelineConfig
+    from data_preprocessing.metrics.common.io_utils import maybe_save_csv
+    from data_preprocessing.metrics.common.time_utils import resolve_time_range
+    from data_preprocessing.metrics.common.transforms import (
+        attach_daily_metric,
+        null_value_check,
+        to_unix_timestamp,
+    )
+    from data_preprocessing.metrics.eth_daily_txn import fetch_eth_daily_txn
+    from data_preprocessing.metrics.ohlc_volume import fetch_eth_ohlc_volume
+    from data_preprocessing.metrics.supply import fetch_eth_supply_daily
 
 OUTPUT_COLUMNS = [
     "ticker",
@@ -50,19 +68,30 @@ def build_universal_metrics(
         caller=caller,
         config=config,
         save=save,
+        as_unix=False,
     )
     if eth_ohlc.empty:
         return _empty_output()
 
-    supply_value = fetch_eth_supply_daily(config=config, save= True)
-    supply_daily = build_daily_series(start_ts, end_ts, supply_value)
-    eth_ohlc = attach_daily_metric(eth_ohlc, supply_daily, "supply")
+    supply_daily_df = fetch_eth_supply_daily(
+        start=start_ts,
+        end=end_ts,
+        config=config,
+        save=save,
+        as_unix=False,
+    )
+    if supply_daily_df.empty:
+        supply_series = pd.Series(dtype="float64")
+    else:
+        supply_series = supply_daily_df.set_index("timestamp")["supply"]
+    eth_ohlc = attach_daily_metric(eth_ohlc, supply_series, "supply")
 
     daily_tx = fetch_eth_daily_txn(
         start=start_ts,
         end=end_ts,
         config=config,
         save=save,
+        as_unix=False,
     )
     if daily_tx.empty:
         daily_series = pd.Series(dtype="float64")
@@ -80,13 +109,15 @@ def build_universal_metrics(
         caller=caller,
         config=config,
         save=save,
+        as_unix=False,
     )
     eth_ohlc = _attach_btc_metrics(eth_ohlc, btc_info)
 
     eth_ohlc = null_value_check(eth_ohlc)
+    output = to_unix_timestamp(eth_ohlc.copy(), "timestamp")
 
-    maybe_save_csv(eth_ohlc, config.output_dir, "eth_metrics_combined.csv", enabled=save)
-    return eth_ohlc[OUTPUT_COLUMNS]
+    maybe_save_csv(output, config.output_dir, "eth_metrics_combined.csv", enabled=save)
+    return output[OUTPUT_COLUMNS]
 
 
 def _attach_btc_metrics(

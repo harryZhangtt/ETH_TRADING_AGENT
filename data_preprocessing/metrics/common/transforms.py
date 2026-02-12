@@ -45,3 +45,13 @@ def null_value_check(df: pd.DataFrame, threshold: float = 0.05) -> pd.DataFrame:
             print(f"Warning: {col} has {ratio:.2%} null values")
     print("[NOTICE]: Null value check passed")
     return df
+
+
+def to_unix_timestamp(df: pd.DataFrame, column: str = "timestamp") -> pd.DataFrame:
+    if column not in df.columns or df.empty:
+        return df
+    if pd.api.types.is_datetime64_any_dtype(df[column]):
+        df[column] = df[column].view("int64") // 1_000_000_000
+    else:
+        df[column] = pd.to_numeric(df[column], errors="coerce")
+    return df

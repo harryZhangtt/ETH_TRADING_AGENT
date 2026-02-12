@@ -6,7 +6,7 @@ import requests
 from .common.config import PipelineConfig
 from .common.io_utils import maybe_save_csv
 from .common.time_utils import resolve_time_range
-from .common.transforms import build_daily_series
+from .common.transforms import build_daily_series, to_unix_timestamp
 
 
 def fetch_eth_supply(
@@ -56,6 +56,7 @@ def fetch_eth_supply_daily(
     period: Optional[str] = None,
     config: PipelineConfig = PipelineConfig(),
     save: bool = True,
+    as_unix: bool = True,
 ) -> pd.DataFrame:
     if start is not None and period is not None:
         raise ValueError("Use either start/end or period, not both.")
@@ -66,5 +67,9 @@ def fetch_eth_supply_daily(
     df = series.reset_index()
     df.columns = ["timestamp", "supply"]
 
-    maybe_save_csv(df, config.output_dir, "eth_supply_daily.csv", enabled=save)
-    return df
+    output = df.copy()
+    if as_unix:
+        output = to_unix_timestamp(output, "timestamp")
+
+    maybe_save_csv(output, config.output_dir, "eth_supply_daily.csv", enabled=save)
+    return output
