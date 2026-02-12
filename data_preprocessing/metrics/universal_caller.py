@@ -8,7 +8,9 @@ try:
     from .common.io_utils import maybe_save_csv
     from .common.time_utils import resolve_time_range
     from .common.transforms import attach_daily_metric, null_value_check, to_unix_timestamp
+    from .eth_rolling_beta import fetch_eth_rolling_beta
     from .eth_daily_txn import fetch_eth_daily_txn
+    from .google_trend import fetch_google_trend
     from .ohlc_volume import fetch_eth_ohlc_volume
     from .supply import fetch_eth_supply_daily
 except ImportError:  # Allow running as a script without package context.
@@ -25,7 +27,9 @@ except ImportError:  # Allow running as a script without package context.
         null_value_check,
         to_unix_timestamp,
     )
+    from data_preprocessing.metrics.eth_rolling_beta import fetch_eth_rolling_beta
     from data_preprocessing.metrics.eth_daily_txn import fetch_eth_daily_txn
+    from data_preprocessing.metrics.google_trend import fetch_google_trend
     from data_preprocessing.metrics.ohlc_volume import fetch_eth_ohlc_volume
     from data_preprocessing.metrics.supply import fetch_eth_supply_daily
 
@@ -39,6 +43,8 @@ OUTPUT_COLUMNS = [
     "low",
     "supply",
     "eth_daily_tx",
+    "google_trend",
+    "eth_rolling_beta",
     "market_cap",
     "volume",
     "btc_open",
@@ -99,6 +105,19 @@ def build_universal_metrics(
         daily_series = daily_tx.set_index("timestamp")["eth_daily_tx"]
     eth_ohlc = attach_daily_metric(eth_ohlc, daily_series, "eth_daily_tx")
 
+    google_df = fetch_google_trend(
+        start=start_ts,
+        end=end_ts,
+        config=config,
+        save=save,
+        as_unix=False,
+    )
+    if google_df.empty:
+        google_series = pd.Series(dtype="float64")
+    else:
+        google_series = google_df.set_index("timestamp")["google_trend"]
+    eth_ohlc = attach_daily_metric(eth_ohlc, google_series, "google_trend")
+
     eth_ohlc["market_cap"] = eth_ohlc["close"].astype("float64") * eth_ohlc[
         "supply"
     ]
@@ -112,6 +131,22 @@ def build_universal_metrics(
         as_unix=False,
     )
     eth_ohlc = _attach_btc_metrics(eth_ohlc, btc_info)
+
+    beta_df = fetch_eth_rolling_beta(
+        start=start_ts,
+        end=end_ts,
+        caller=caller,
+        config=config,
+        window=config.rolling_beta_window,
+        eth_df=eth_ohlc,
+        btc_df=btc_info,
+        save=save,
+        as_unix=False,
+    )
+    if beta_df.empty:
+        eth_ohlc["eth_rolling_beta"] = pd.Series(dtype="float64")
+    else:
+        eth_ohlc = eth_ohlc.merge(beta_df, on="timestamp", how="left")
 
     eth_ohlc = null_value_check(eth_ohlc)
     output = to_unix_timestamp(eth_ohlc.copy(), "timestamp")
@@ -156,6 +191,8 @@ def _empty_output() -> pd.DataFrame:
             "low": pd.Series(dtype="float64"),
             "supply": pd.Series(dtype="float64"),
             "eth_daily_tx": pd.Series(dtype="float64"),
+            "google_trend": pd.Series(dtype="float64"),
+            "eth_rolling_beta": pd.Series(dtype="float64"),
             "market_cap": pd.Series(dtype="float64"),
             "volume": pd.Series(dtype="float64"),
             "btc_open": pd.Series(dtype="float64"),

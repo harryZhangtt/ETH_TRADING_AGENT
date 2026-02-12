@@ -14,4 +14,15 @@ class PipelineConfig:
     etherscan_chain_id: int = 1
     etherscan_chart_tx_url: str = "https://etherscan.io/chart/tx"
     output_dir: str = "data_preprocessing/data/metrics"
+    rolling_beta_window: int = 24
+    google_trend_keyword: str = "Ethereum"
+    google_trend_geo: str = ""
+    google_trend_hl: str = "en-US"
+    google_trend_tz: int = 0
+    google_trend_category: int = 0
+    google_trend_chunk_days: int = 180
+    google_trend_overlap_days: int = 7
+    google_trend_anchor_days: int = 90
+    google_trend_max_retries: int = 5
+    google_trend_backoff_seconds: float = 5.0
     debug: bool = False
