@@ -1,0 +1,21 @@
+{
+  "rows": 85136,
+  "features": [
+    "low",
+    "high",
+    "Open",
+    "close",
+    "volume",
+    "supply",
+    "eth_daily_tx",
+    "market_cap",
+    "btc_open",
+    "btc_high",
+    "btc_low",
+    "btc_close",
+    "btc_volume",
+    "eth_return",
+    "btc_return"
+  ],
+  "pca_components_used": 5
+}
