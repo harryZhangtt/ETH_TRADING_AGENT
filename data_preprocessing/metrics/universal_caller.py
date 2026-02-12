@@ -9,7 +9,7 @@ from .common.time_utils import resolve_time_range
 from .common.transforms import attach_daily_metric, build_daily_series, null_value_check
 from .eth_daily_txn import fetch_eth_daily_txn
 from .ohlc_volume import fetch_eth_ohlc_volume
-from .supply import fetch_eth_supply
+from .supply import fetch_eth_supply_daily
 
 OUTPUT_COLUMNS = [
     "ticker",
@@ -54,7 +54,7 @@ def build_universal_metrics(
     if eth_ohlc.empty:
         return _empty_output()
 
-    supply_value = fetch_eth_supply(config=config)
+    supply_value = fetch_eth_supply_daily(config=config, save= True)
     supply_daily = build_daily_series(start_ts, end_ts, supply_value)
     eth_ohlc = attach_daily_metric(eth_ohlc, supply_daily, "supply")
 
