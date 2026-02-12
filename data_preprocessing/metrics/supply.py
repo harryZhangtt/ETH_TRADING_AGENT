@@ -112,6 +112,7 @@ def fetch_eth_supply_growth(
 
     df = _normalize_timestamp(df)
     df = _rename_value_columns(df)
+    df = _ensure_supply_column(df, debug=config.debug)
     df = _filter_range(df, start_ts, end_ts)
     df = df.sort_values("timestamp")
 
@@ -163,8 +164,41 @@ def _filter_range(df: pd.DataFrame, start_ts: pd.Timestamp, end_ts: pd.Timestamp
     return df.loc[mask].copy()
 
 
+def _ensure_supply_column(df: pd.DataFrame, debug: bool = False) -> pd.DataFrame:
+    if "supply" in df.columns:
+        return df
+
+    candidates = [
+        "value",
+        "eth_supply",
+        "total_supply",
+        "ethersupply",
+        "eth_supply_total",
+    ]
+    for candidate in candidates:
+        if candidate in df.columns:
+            df["supply"] = pd.to_numeric(df[candidate], errors="coerce")
+            return df
+
+    numeric_cols = [
+        col
+        for col in df.columns
+        if col != "timestamp" and pd.api.types.is_numeric_dtype(df[col])
+    ]
+    if numeric_cols:
+        df["supply"] = pd.to_numeric(df[numeric_cols[0]], errors="coerce")
+        if debug:
+            print(
+                f"[DEBUG] supply column derived from {numeric_cols[0]}"
+            )
+        return df
+
+    if debug:
+        print(f"[DEBUG] supply column not found. columns={list(df.columns)}")
+    return df
+
+
 if __name__ == "__main__":
     cfg = PipelineConfig(debug=True)
     print(fetch_eth_supply_daily(period="30d", config=cfg).head())
     print(fetch_eth_supply_growth(period="365d", config=cfg).head())
-

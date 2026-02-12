@@ -31,7 +31,7 @@ except ImportError:  # Allow running as a script without package context.
     from data_preprocessing.metrics.eth_daily_txn import fetch_eth_daily_txn
     from data_preprocessing.metrics.google_trend import fetch_google_trend
     from data_preprocessing.metrics.ohlc_volume import fetch_eth_ohlc_volume
-    from data_preprocessing.metrics.supply import fetch_eth_supply_daily
+    from data_preprocessing.metrics.supply import fetch_eth_supply_growth
 
 OUTPUT_COLUMNS = [
     "ticker",

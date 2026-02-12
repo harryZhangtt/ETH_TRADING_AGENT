@@ -29,8 +29,22 @@ def attach_daily_metric(
         return df
 
     series = daily_series.copy()
-    series.index = pd.to_datetime(series.index, utc=True).floor("D")
+    if series.index.has_duplicates:
+        dup_count = int(series.index.duplicated().sum())
+        print(
+            f"[WARN] attach_daily_metric deduped {dup_count} duplicate daily "
+            f"timestamps for {column_name}"
+        )
+    if pd.api.types.is_numeric_dtype(series.index):
+        series.index = pd.to_datetime(
+            series.index, unit="s", utc=True, errors="coerce"
+        )
+    else:
+        series.index = pd.to_datetime(series.index, utc=True, errors="coerce")
+    series.index = series.index.floor("D")
     series = series.sort_index()
+    if series.index.has_duplicates:
+        series = series[~series.index.duplicated(keep="last")]
 
     hourly_index = df["timestamp"].dt.floor("h")
     df[column_name] = series.reindex(hourly_index, method="ffill").values
