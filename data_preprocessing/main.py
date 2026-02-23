@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from analytics import AnalyticsConfig, analyze_metrics
+from further_preprocessing import build_midway_dataset
 from metrics import PipelineConfig,build_universal_metrics
 
 
@@ -19,6 +20,13 @@ def main() -> None:
         raise FileNotFoundError(
             f"Metrics CSV not found at {metrics_csv}. Run the metrics pipeline first."
         )
+
+    build_midway_dataset(
+        input_csv=Path(metrics_csv),
+        output_dir=Path("data_preprocessing/data/midway"),
+        output_name="eth_metrics_midway.csv",
+        multi_day_lag=7,
+    )
 
     analytics_config = AnalyticsConfig(
         input_csv=metrics_csv,
