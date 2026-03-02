@@ -1,4 +1,4 @@
-from typing import Optional, Union
+from typing import List, Optional, Union
 
 import pandas as pd
 
@@ -153,6 +153,124 @@ def build_universal_metrics(
 
     maybe_save_csv(output, config.output_dir, "eth_metrics_combined.csv", enabled=save)
     return output[OUTPUT_COLUMNS]
+
+
+def append_upon_universal_metrics(
+    datas: List[str],
+    fields_to_append: List[str],
+    combined_csv: str = "data/metrics/eth_metrics_combined.csv",
+    save: bool = True,
+    output_dir: str = "data/metrics",
+    output_filename: str = "eth_metrics_combined_macro.csv",
+) -> pd.DataFrame:
+    """Enrich the cached hourly ETH metrics CSV with daily macro-economic data.
+
+    Reads *combined_csv* (hourly, Unix-second timestamps) and forward-fills
+    each daily macro series onto every hourly row, then optionally saves the
+    result.
+
+    Parameters
+    ----------
+    datas:
+        Ordered list of paths to macro CSV files.  Each file must contain a
+        ``Date`` column (YYYY-MM-DD, business-day cadence) and a ``Close``
+        column.
+    fields_to_append:
+        Column names to assign to the corresponding entry in *datas*.  Must
+        be the same length as *datas*.
+    combined_csv:
+        Path to the base ``eth_metrics_combined.csv`` produced by
+        ``build_universal_metrics``.
+    save:
+        Persist the enriched DataFrame to *output_dir* / *output_filename*.
+    output_dir:
+        Directory for the saved CSV.
+    output_filename:
+        Filename for the saved output.
+
+    Returns
+    -------
+    pd.DataFrame
+        Hourly DataFrame with macro columns appended.  The ``timestamp``
+        column is Unix seconds (int64).  Column order: all OUTPUT_COLUMNS
+        that are present, followed by the new macro columns.
+
+    Raises
+    ------
+    ValueError
+        If *datas* and *fields_to_append* have different lengths.
+    FileNotFoundError
+        If *combined_csv* does not exist.
+    """
+    if len(datas) != len(fields_to_append):
+        raise ValueError(
+            f"datas and fields_to_append must have equal length "
+            f"(got {len(datas)} vs {len(fields_to_append)})"
+        )
+
+    from pathlib import Path
+
+    if not Path(combined_csv).exists():
+        raise FileNotFoundError(
+            f"Base metrics CSV not found: {combined_csv!r}.  "
+            "Run build_universal_metrics first."
+        )
+
+    # ── Load base hourly DataFrame ─────────────────────────────────────────
+    df = pd.read_csv(combined_csv)
+    if df.empty:
+        return df
+
+    # Unix-second ints → UTC datetime so .dt accessor works inside
+    # attach_daily_metric (which calls df["timestamp"].dt.floor("h")).
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s", utc=True)
+
+    # ── Drop stale macro columns so repeated calls replace, not accumulate ─
+    # Handles the case where combined_csv already contains a previous run's
+    # output (e.g. eth_metrics_combined_macro.csv fed back as combined_csv).
+    stale = [f for f in fields_to_append if f in df.columns]
+    if stale:
+        df = df.drop(columns=stale)
+
+    # ── Attach each macro series via daily → hourly forward-fill ──────────
+    for csv_path, field_name in zip(datas, fields_to_append):
+        raw = pd.read_csv(csv_path)
+
+        if raw.empty or "Date" not in raw.columns or "Close" not in raw.columns:
+            print(f"[WARN] append_upon_universal_metrics: skipping {csv_path!r} "
+                  "(missing Date or Close column)")
+            df[field_name] = pd.NA
+            continue
+
+        # Build a UTC-indexed daily Series (business-day cadence → gaps are
+        # fine; attach_daily_metric will ffill across weekends automatically).
+        daily_series: pd.Series = (
+            pd.Series(
+                raw["Close"].astype("float64").values,
+                index=pd.to_datetime(raw["Date"], utc=True),
+            )
+            .sort_index()
+        )
+        if daily_series.index.has_duplicates:
+            daily_series = daily_series[~daily_series.index.duplicated(keep="last")]
+
+        df = attach_daily_metric(df, daily_series, field_name)
+
+    # ── Convert timestamp back to Unix seconds (matches pipeline convention) ─
+    df = to_unix_timestamp(df, "timestamp")
+
+    # ── Stable column ordering: base schema first, then new macro columns ──
+    base_cols = [c for c in OUTPUT_COLUMNS if c in df.columns]
+    macro_cols = [f for f in fields_to_append if f in df.columns and f not in base_cols]
+    df = df[base_cols + macro_cols]
+    
+    
+    #null value check 
+    df= null_value_check(df)
+    
+
+    maybe_save_csv(df, output_dir, output_filename, enabled=save)
+    return df
 
 
 def _attach_btc_metrics(
