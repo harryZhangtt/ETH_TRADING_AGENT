@@ -7,10 +7,10 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 
-DEFAULT_INPUT = Path("data_preprocessing/data/metrics/eth_metrics_combined.csv")
-DEFAULT_OUTPUT_DIR = Path("data_preprocessing/data/midway")
+DEFAULT_INPUT = Path("data/metrics/eth_metrics_combined_macro.csv")
+DEFAULT_OUTPUT_DIR = Path("data/midway")
 DEFAULT_OUTPUT_NAME = "eth_metrics_midway.csv"
-METRICS_DIR = Path("data_preprocessing/data/metrics")
+METRICS_DIR = Path("data/metrics")
 
 
 METRIC_ALIASES: Dict[str, List[str]] = {
@@ -47,6 +47,17 @@ METRIC_ALIASES: Dict[str, List[str]] = {
         "daily_active_ethereum_address",
         "daily_active_eth_address",
     ],
+    # Macro indices appended in main.py
+    "sp500": ["sp500", "sp_500"],
+    "nasdaq": ["nasdaq"],
+    "dow30": ["dow30", "dow_30"],
+    "vix": ["vix"],
+    "gold": ["gold"],
+    "crude_oil": ["crude_oil", "crudeoil"],
+    "nikkei225": ["nikkei225"],
+    "ftse100": ["ftse100"],
+    "sse": ["sse"],
+    "eurostoxx": ["eurostoxx"],
 }
 
 SUPPLEMENTAL_SOURCES: Dict[str, Dict[str, object]] = {
@@ -290,6 +301,62 @@ def _load_supplemental_series(
     return output, source_ref
 
 
+def evaluate_pnl(
+    timestamps: List[int],
+    weights: List[float],
+    open_prices: List[float],
+    close_prices: List[float],
+    volumes: Optional[List[float]] = None,
+) -> Dict[str, List[float]]:
+    """
+    Evaluate per-period PnL and cumulative PnL for a simple strategy.
+
+    Parameters
+    ----------
+    timestamps : list of unix seconds (or any numeric ids)
+    weights : exposure per period (e.g., -1..+1, where 1 is fully long)
+    open_prices : asset open prices for each period
+    close_prices : asset close prices for each period
+    volumes : optional trade/market volume per period (currently unused but
+        accepted so that callers can pass (timestamp, weight, OHLC, volume)
+        without schema changes later).
+
+    Returns
+    -------
+    dict with:
+        - "timestamp": original timestamps
+        - "pnl": per-period PnL, assuming unit capital
+        - "cumulative_pnl": cumulative sum of per-period PnL
+    """
+    n = len(timestamps)
+    if not (len(weights) == len(open_prices) == len(close_prices) == n):
+        raise ValueError("All input series must have the same length.")
+
+    pnl: List[float] = [math.nan] * n
+    cumulative: List[float] = [math.nan] * n
+
+    running = 0.0
+    for i in range(n):
+        w = float(weights[i])
+        o = float(open_prices[i])
+        c = float(close_prices[i])
+        if o <= 0 or math.isnan(w) or math.isnan(o) or math.isnan(c):
+            pnl[i] = math.nan
+            cumulative[i] = running
+            continue
+        ret = (c - o) / o
+        step_pnl = w * ret
+        running += step_pnl
+        pnl[i] = step_pnl
+        cumulative[i] = running
+
+    return {
+        "timestamp": list(timestamps),
+        "pnl": pnl,
+        "cumulative_pnl": cumulative,
+    }
+
+
 def build_midway_dataset(
     input_csv: Path = DEFAULT_INPUT,
     output_dir: Path = DEFAULT_OUTPUT_DIR,
@@ -385,6 +452,17 @@ def build_midway_dataset(
             "log_daily_token_transfer_change",
         ),
         ("macro_economics", "log_macro_economics", "log_macro_economics_change"),
+        # Individual macro indices
+        ("sp500", "log_sp500", "log_sp500_change"),
+        ("nasdaq", "log_nasdaq", "log_nasdaq_change"),
+        ("dow30", "log_dow30", "log_dow30_change"),
+        ("vix", "log_vix", "log_vix_change"),
+        ("gold", "log_gold", "log_gold_change"),
+        ("crude_oil", "log_crude_oil", "log_crude_oil_change"),
+        ("nikkei225", "log_nikkei225", "log_nikkei225_change"),
+        ("ftse100", "log_ftse100", "log_ftse100_change"),
+        ("sse", "log_sse", "log_sse_change"),
+        ("eurostoxx", "log_eurostoxx", "log_eurostoxx_change"),
     ]
 
     computed: Dict[str, List[float]] = {
