@@ -23,7 +23,6 @@ METRIC_ALIASES: Dict[str, List[str]] = {
     "daily_txn": ["eth_daily_tx", "daily_txn", "eth_daily_txn", "daily_transactions"],
     "google_trend": ["google_trend", "eth_google_trend"],
     "market_beta": ["eth_rolling_beta", "market_beta", "eth_market_beta", "rolling_beta"],
-    "tweet_volume": ["tweet_volume", "eth_tweet_volume"],
     "network_tx_fee": ["network_tx_fee", "eth_network_tx_fee", "network_txfee"],
     "btc_hashrate": ["btc_hashrate", "bitcoin_hashrate"],
     "spread": ["spread", "order_book_spread", "bid_ask_spread"],
@@ -37,11 +36,6 @@ METRIC_ALIASES: Dict[str, List[str]] = {
         "daily_token_transfer",
         "daily_token_transfers",
         "eth_erc20_daily_token_transfers",
-    ],
-    "macro_economics": [
-        "macro_economics",
-        "macro_index",
-        "macro_factor",
     ],
     "daily_active_ethereum_address": [
         "daily_active_ethereum_address",
@@ -61,10 +55,6 @@ METRIC_ALIASES: Dict[str, List[str]] = {
 }
 
 SUPPLEMENTAL_SOURCES: Dict[str, Dict[str, object]] = {
-    "tweet_volume": {
-        "path": METRICS_DIR / "eth_tweet_volume.csv",
-        "value_columns": ["tweet_volume"],
-    },
     "network_tx_fee": {
         "path": METRICS_DIR / "eth_avg_txfee.csv",
         "value_columns": ["avg_txfee_eth", "network_tx_fee"],
@@ -172,9 +162,49 @@ def _safe_log(value: float) -> float:
         return math.nan
     return math.log(value)
 
+def _safe_log1p(value: float) -> float:
+    if math.isnan(value) or value < 0:
+        return math.nan
+    return math.log1p(value)
+
+
+def _safe_signed_log1p(value: float) -> float:
+    if math.isnan(value):
+        return math.nan
+    sign = -1.0 if value < 0 else 1.0
+    return sign * math.log1p(abs(value))
+
+
+def _ffill(series: List[float], backfill_initial: bool = True) -> List[float]:
+    """
+    Forward-fill NaNs. Optionally backfill leading NaNs with first real value.
+    """
+    out: List[float] = [math.nan] * len(series)
+    last = math.nan
+    first_real: Optional[float] = None
+    for i, v in enumerate(series):
+        if not math.isnan(v):
+            last = v
+            if first_real is None:
+                first_real = v
+        out[i] = last
+    if backfill_initial and first_real is not None:
+        for i, v in enumerate(out):
+            if not math.isnan(v):
+                break
+            out[i] = first_real
+    return out
+
 
 def _log_series(series: List[float]) -> List[float]:
     return [_safe_log(v) for v in series]
+
+def _log1p_series(series: List[float]) -> List[float]:
+    return [_safe_log1p(v) for v in series]
+
+
+def _signed_log1p_series(series: List[float]) -> List[float]:
+    return [_safe_signed_log1p(v) for v in series]
 
 
 def _log_ratio(series: List[float], lag: int) -> List[float]:
@@ -185,6 +215,30 @@ def _log_ratio(series: List[float], lag: int) -> List[float]:
         if math.isnan(cur) or math.isnan(prev) or cur <= 0 or prev <= 0:
             continue
         out[i] = math.log(cur / prev)
+    return out
+
+def _log1p_ratio(series: List[float], lag: int) -> List[float]:
+    out = [math.nan] * len(series)
+    for i in range(lag, len(series)):
+        cur = series[i]
+        prev = series[i - lag]
+        if math.isnan(cur) or math.isnan(prev) or cur < 0 or prev < 0:
+            continue
+        out[i] = math.log((1.0 + cur) / (1.0 + prev))
+    return out
+
+
+def _signed_log1p_diff(series: List[float], lag: int) -> List[float]:
+    """
+    Delta of signed-log1p transform. Works for series that can cross 0.
+    """
+    out = [math.nan] * len(series)
+    for i in range(lag, len(series)):
+        cur = series[i]
+        prev = series[i - lag]
+        if math.isnan(cur) or math.isnan(prev):
+            continue
+        out[i] = _safe_signed_log1p(cur) - _safe_signed_log1p(prev)
     return out
 
 
@@ -218,6 +272,55 @@ def _read_rows(input_csv: Path) -> Tuple[List[str], List[Dict[str, str]]]:
         fieldnames = reader.fieldnames or []
         rows = list(reader)
     return fieldnames, rows
+
+
+def _maybe_repair_timestamps(input_csv: Path, rows: List[Dict[str, str]]) -> None:
+    """
+    If the input CSV's timestamps look broken (e.g. constant small numbers),
+    repair them in-place using the non-macro combined metrics file.
+
+    This repo has had cases where `eth_metrics_combined_macro.csv` was written
+    with an invalid `timestamp` column. Supplemental-series alignment depends
+    on a correct Unix-second timestamp.
+    """
+    if not rows:
+        return
+    # sample a few timestamps to decide if they look like Unix seconds
+    sample_idx = [0, len(rows) // 2, len(rows) - 1] if len(rows) >= 3 else [0]
+    parsed: List[int] = []
+    for i in sample_idx:
+        ts = _parse_timestamp_to_unix(rows[i].get("timestamp"))
+        if ts is not None:
+            parsed.append(ts)
+    if not parsed:
+        return
+
+    # Heuristic: Unix seconds for modern crypto data should be > 1_000_000_000.
+    # If all sampled timestamps are <= 1e9, treat as broken.
+    if max(parsed) > 1_000_000_000:
+        return
+
+    # Try to locate a sibling combined CSV with correct timestamps.
+    # Default: replace "..._macro.csv" with ".csv"
+    candidate = input_csv
+    if input_csv.name.endswith("_macro.csv"):
+        candidate = input_csv.with_name(input_csv.name.replace("_macro.csv", ".csv"))
+    else:
+        # fall back to the known canonical file
+        candidate = Path("data/metrics/eth_metrics_combined.csv")
+
+    if not candidate.exists():
+        return
+
+    ref_fieldnames, ref_rows = _read_rows(candidate)
+    if not ref_rows or len(ref_rows) != len(rows):
+        return
+    if "timestamp" not in ref_fieldnames:
+        return
+
+    # Copy reference timestamp strings into rows in-place
+    for i in range(len(rows)):
+        rows[i]["timestamp"] = ref_rows[i].get("timestamp", rows[i].get("timestamp", ""))
 
 
 def _sort_rows_by_timestamp(rows: List[Dict[str, str]]) -> List[Dict[str, str]]:
@@ -364,6 +467,7 @@ def build_midway_dataset(
     multi_day_lag: int = 7,
 ) -> Tuple[Path, Path]:
     fieldnames, rows = _read_rows(input_csv)
+    _maybe_repair_timestamps(input_csv, rows)
     rows = _sort_rows_by_timestamp(rows)
 
     resolved_base = {key: _resolve_column(fieldnames, key) for key in METRIC_ALIASES}
@@ -411,6 +515,10 @@ def build_midway_dataset(
                 chosen_series = derived
                 resolved[metric_key] = "derived:avg_txn_fee*daily_txn"
 
+        # Most supplemental sources are daily and sparse; forward-fill onto the
+        # hourly base grid so downstream log-change features aren't mostly NaN.
+        chosen_series = _ffill(chosen_series, backfill_initial=True)
+
         series_cache[metric_key] = chosen_series
         return chosen_series
 
@@ -432,7 +540,6 @@ def build_midway_dataset(
         ("daily_txn", "log_daily_txn", None),
         ("google_trend", "log_google_trend", "log_google_trend_change"),
         ("market_beta", "log_market_beta", None),
-        ("tweet_volume", "log_tweet_volume", "log_tweet_volume_change"),
         ("network_tx_fee", "log_network_tx_fee", "log_network_tx_fee_change"),
         ("btc_hashrate", "log_btc_hashrate", "log_btc_hashrate_change"),
         ("spread", "log_spread", "log_spread_change"),
@@ -451,7 +558,6 @@ def build_midway_dataset(
             "log_daily_token_transfer",
             "log_daily_token_transfer_change",
         ),
-        ("macro_economics", "log_macro_economics", "log_macro_economics_change"),
         # Individual macro indices
         ("sp500", "log_sp500", "log_sp500_change"),
         ("nasdaq", "log_nasdaq", "log_nasdaq_change"),
@@ -472,17 +578,49 @@ def build_midway_dataset(
         "btc_single_day_log_return": btc_single_day_log_return,
     }
 
+    # Transform choices:
+    # - log: strictly-positive levels (prices, indices)
+    # - log1p: non-negative counts/scores that can be 0 (trends, fees, volumes)
+    # - signed_log1p: values that can be negative (beta, imbalance)
+    log1p_metrics = {
+        "volume",
+        "daily_txn",
+        "google_trend",
+        "network_tx_fee",
+        "btc_hashrate",
+        "spread",
+        "ask_depth",
+        "bid_depth",
+        "unique_addr",
+        "avg_txn_fee",
+        "avg_block_size",
+        "daily_token_transfer",
+        "daily_active_ethereum_address",
+    }
+    signed_log1p_metrics = {
+        "market_beta",
+        "order_book_imbalance",
+    }
+
     for metric_key, log_name, change_name in feature_specs:
         series = get_series(metric_key)
-        computed[log_name] = _log_series(series)
+        if metric_key in signed_log1p_metrics:
+            computed[log_name] = _signed_log1p_series(series)
+        elif metric_key in log1p_metrics:
+            computed[log_name] = _log1p_series(series)
+        else:
+            computed[log_name] = _log_series(series)
         if change_name is not None:
-            computed[change_name] = _log_ratio(series, lag=1)
+            if metric_key in signed_log1p_metrics:
+                computed[change_name] = _signed_log1p_diff(series, lag=1)
+            elif metric_key in log1p_metrics:
+                computed[change_name] = _log1p_ratio(series, lag=1)
+            else:
+                computed[change_name] = _log_ratio(series, lag=1)
 
     # Daily Active Ethereum Address (delta_log), if present.
     daily_active_series = get_series("daily_active_ethereum_address")
-    computed["daily_active_ethereum_address_delta_log"] = _log_ratio(
-        daily_active_series, lag=1
-    )
+    computed["daily_active_ethereum_address_delta_log"] = _log1p_ratio(daily_active_series, lag=1)
 
     output_dir.mkdir(parents=True, exist_ok=True)
     output_csv = output_dir / output_name
