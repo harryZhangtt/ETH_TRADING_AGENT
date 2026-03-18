@@ -8,7 +8,7 @@ import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
 
-from ..rewards import *
+from rewards import *
 
 
 @dataclass(frozen=True)

@@ -138,14 +138,18 @@ class PPOSharedTransformerActorCritic(nn.Module):
             nn.Linear(cfg.latent_dim, 1),
         )
 
-    def forward(self, x_seq: torch.Tensor, x_port: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self, x_seq: torch.Tensor, x_port: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         h = self.encoder(x_seq, x_port)
         logits = self.actor(h)  # [B, action_dim]
         value = self.critic(h).squeeze(-1)  # [B]
         return logits, value
 
     @torch.no_grad()
-    def act(self, x_seq: torch.Tensor, x_port: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def act(
+        self, x_seq: torch.Tensor, x_port: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Sample actions from the current policy.
         Returns:
@@ -187,11 +191,13 @@ if __name__ == "__main__":
     import torch
     from model import PPOSharedTransformerActorCritic
 
-    B, T, F = 32, 60, 20      # batch=32，window size=60 days，20 features per day
-    P = 8                     # portfolio state dim
-    A = 11                    # discrete action here（0.0~1.0 step 0.1）
+    B, T, F = 32, 60, 20  # batch=32，window size=60 days，20 features per day
+    P = 3  # portfolio state dim
+    A = 11  # discrete action here（0.0~1.0 step 0.1）
 
-    net = PPOSharedTransformerActorCritic(seq_feature_dim=F, portfolio_dim=P, action_dim=A)
+    net = PPOSharedTransformerActorCritic(
+        seq_feature_dim=F, portfolio_dim=P, action_dim=A
+    )
 
     x_seq = torch.randn(B, T, F)
     x_port = torch.randn(B, P)
