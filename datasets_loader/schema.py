@@ -42,8 +42,8 @@ SEQ_FEATURE_COLS: Final[Tuple[str, ...]] = (
     # market structure
     "log_market_beta",
     # social
-    "log_tweet_volume",
-    "log_tweet_volume_change",
+    # "log_tweet_volume",
+    # "log_tweet_volume_change",
     # network fees
     "log_network_tx_fee",
     "log_network_tx_fee_change",
@@ -69,8 +69,8 @@ SEQ_FEATURE_COLS: Final[Tuple[str, ...]] = (
     "log_daily_token_transfer",
     "log_daily_token_transfer_change",
     # macro aggregate-> TODO: change this with actual implementation when midway data is done
-    "log_macro_economics",
-    "log_macro_economics_change",
+    # "log_macro_economics",
+    # "log_macro_economics_change",
     # address growth
     "daily_active_ethereum_address_delta_log",
 )

@@ -58,9 +58,6 @@ class DataPipelineConfig:
 
     rows_per_day: int = 24
 
-    train_frac: float = 0.70
-    val_frac: float = 0.15
-
     feature_cols: Optional[Tuple[str, ...]] = None
 
 
@@ -277,29 +274,6 @@ def _prepare_actionable_table(
     return out, feature_cols
 
 
-def _split_core_ranges(
-    n: int,
-    train_frac: float,
-    val_frac: float,
-) -> Tuple[Tuple[int, int], Tuple[int, int], Tuple[int, int]]:
-    if not (0.0 < train_frac < 1.0):
-        raise ValueError(f"train_frac must be in (0,1), got {train_frac}")
-    if not (0.0 <= val_frac < 1.0):
-        raise ValueError(f"val_frac must be in [0,1), got {val_frac}")
-    if train_frac + val_frac >= 1.0:
-        raise ValueError("train_frac + val_frac must be < 1.0")
-
-    train_end = int(n * train_frac)
-    val_end = int(n * (train_frac + val_frac))
-
-    if train_end <= 0 or val_end <= train_end or val_end >= n:
-        raise ValueError(
-            f"Bad split sizes for n={n}: train_end={train_end}, val_end={val_end}"
-        )
-
-    return (0, train_end), (train_end, val_end), (val_end, n)
-
-
 def _make_segment_arrays(
     df: pd.DataFrame,
     core_start: int,
@@ -338,113 +312,65 @@ def _make_segment_arrays(
     return x, r_mkt_log, sigma, dates, meta
 
 
-def build_trading_envs_from_csv(
-    data_cfg: DataPipelineConfig,
-    env_cfg: TradingEnvConfig = TradingEnvConfig(),
-) -> Dict[str, Any]:
-    window_rows = _effective_window_rows(data_cfg)
+# ── Public API ────────────────────────────────────────────────────────────────
 
-    if env_cfg.window_len != window_rows:
-        raise ValueError(
-            f"env_cfg.window_len must equal history_days * rows_per_day = "
-            f"{data_cfg.history_days} * {data_cfg.rows_per_day} = {window_rows}, "
-            f"but got env_cfg.window_len={env_cfg.window_len}."
-        )
+def load_actionable_df(cfg: DataPipelineConfig) -> Tuple[pd.DataFrame, Tuple[str, ...]]:
+    """Load CSV, engineer features, and return the cleaned actionable DataFrame.
 
-    raw_df = _load_csv(data_cfg)
-    feat_df = _add_hourly_features(raw_df, data_cfg)
-    df, feature_cols = _prepare_actionable_table(feat_df, data_cfg)
+    Responsibilities end here — no splitting, no scaling, no env construction.
+    The caller (e.g. train.py) owns all of that.
 
-    n = len(df)
-    (tr_s, tr_e), (va_s, va_e), (te_s, te_e) = _split_core_ranges(
-        n=n,
-        train_frac=data_cfg.train_frac,
-        val_frac=data_cfg.val_frac,
+    Returns
+    -------
+    df           : actionable DataFrame with NaN rows dropped
+    feature_cols : ordered tuple of feature column names
+    """
+    raw_df = _load_csv(cfg)
+    feat_df = _add_hourly_features(raw_df, cfg)
+    return _prepare_actionable_table(feat_df, cfg)
+
+
+def fit_standardizer(
+    df: pd.DataFrame,
+    train_start: int,
+    train_end: int,
+    feature_cols: Sequence[str],
+) -> Standardizer:
+    """Fit a Standardizer on the training slice only."""
+    x_train = df.iloc[train_start:train_end][list(feature_cols)].to_numpy(
+        dtype=np.float32
     )
+    return _fit_standardizer(x_train)
 
-    train_core_raw = df.iloc[tr_s:tr_e][list(feature_cols)].to_numpy(dtype=np.float32)
-    scaler = _fit_standardizer(train_core_raw)
 
-    x_train, r_train, sigma_train, dates_train, train_meta = _make_segment_arrays(
+def make_env_from_slice(
+    df: pd.DataFrame,
+    core_start: int,
+    core_end: int,
+    feature_cols: Sequence[str],
+    scaler: Standardizer,
+    env_cfg: TradingEnvConfig,
+    window_rows: int,
+    timestamp_col: str = "timestamp",
+) -> TradingEnv:
+    """Build a TradingEnv from a row slice of the actionable DataFrame.
+
+    The slice [core_start, core_end) defines the *actionable* rows; the
+    function prepends window_rows-1 context rows automatically so the first
+    observation is valid.
+    """
+    x, r_mkt_log, sigma, dates, _ = _make_segment_arrays(
         df=df,
-        core_start=tr_s,
-        core_end=tr_e,
+        core_start=core_start,
+        core_end=core_end,
         feature_cols=feature_cols,
         scaler=scaler,
         window_rows=window_rows,
-        timestamp_col=data_cfg.timestamp_col,
+        timestamp_col=timestamp_col,
     )
-    x_val, r_val, sigma_val, dates_val, val_meta = _make_segment_arrays(
-        df=df,
-        core_start=va_s,
-        core_end=va_e,
-        feature_cols=feature_cols,
-        scaler=scaler,
-        window_rows=window_rows,
-        timestamp_col=data_cfg.timestamp_col,
-    )
-    x_test, r_test, sigma_test, dates_test, test_meta = _make_segment_arrays(
-        df=df,
-        core_start=te_s,
-        core_end=te_e,
-        feature_cols=feature_cols,
-        scaler=scaler,
-        window_rows=window_rows,
-        timestamp_col=data_cfg.timestamp_col,
-    )
+    return TradingEnv(X=x, r_mkt_log=r_mkt_log, sigma=sigma, dates=dates, config=env_cfg)
 
-    train_env = TradingEnv(
-        X=x_train,
-        r_mkt_log=r_train,
-        sigma=sigma_train,
-        dates=dates_train,
-        config=env_cfg,
-    )
-    val_env = TradingEnv(
-        X=x_val,
-        r_mkt_log=r_val,
-        sigma=sigma_val,
-        dates=dates_val,
-        config=env_cfg,
-    )
-    test_env = TradingEnv(
-        X=x_test,
-        r_mkt_log=r_test,
-        sigma=sigma_test,
-        dates=dates_test,
-        config=env_cfg,
-    )
 
-    feature_groups = _build_feature_groups(feature_cols)
-
-    meta = {
-        "num_rows_raw": len(raw_df),
-        "num_rows_actionable": len(df),
-        "feature_dim": len(feature_cols),
-        "history_days": data_cfg.history_days,
-        "sigma_days": data_cfg.sigma_days,
-        "multi_day_return_days": data_cfg.multi_day_return_days,
-        "rows_per_day": data_cfg.rows_per_day,
-        "window_rows": window_rows,
-        "sigma_rows": _effective_sigma_rows(data_cfg),
-        "multi_day_rows": _effective_multi_day_rows(data_cfg),
-        "train_core_range": (tr_s, tr_e),
-        "val_core_range": (va_s, va_e),
-        "test_core_range": (te_s, te_e),
-        "train_segment": train_meta,
-        "val_segment": val_meta,
-        "test_segment": test_meta,
-        "train_env_T": len(x_train),
-        "val_env_T": len(x_val),
-        "test_env_T": len(x_test),
-    }
-
-    return {
-        "train_env": train_env,
-        "val_env": val_env,
-        "test_env": test_env,
-        "feature_cols": feature_cols,
-        "feature_groups": feature_groups,
-        "standardizer": scaler,
-        "meta": meta,
-    }
+def build_feature_groups(feature_cols: Sequence[str]) -> FeatureGroups:
+    """Public wrapper — build FeatureGroups from an ordered feature list."""
+    return _build_feature_groups(feature_cols)

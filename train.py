@@ -5,7 +5,7 @@ import json
 import random
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -14,7 +14,13 @@ import torch
 from augment.transforms import AugmentConfig, TradingAugmenter
 from algos import PPOLossConfig
 from algos import PPOTrainer, PPOTrainerConfig
-from datasets import DataPipelineConfig, build_trading_envs_from_csv
+from datasets import (
+    DataPipelineConfig,
+    build_feature_groups,
+    fit_standardizer,
+    load_actionable_df,
+    make_env_from_slice,
+)
 from envs import TradingEnvConfig
 from models import ModelConfig, PPOSharedTransformerActorCritic
 
@@ -36,8 +42,12 @@ class TrainConfig:
     sigma_days: int = 20
     multi_day_return_days: int = 7
     rows_per_day: int = 24
-    train_frac: float = 0.70
-    val_frac: float = 0.15
+
+    # Walk-forward split parameters (all in days; converted to rows internally)
+    min_train_days: int = 365   # minimum training window (expanding)
+    val_days: int = 90          # validation window per fold
+    test_days: int = 90         # test window per fold
+    step_days: int = 90         # how many days to advance per fold
 
     alpha: float = 0.001
     lambda_risk: float = 0.1
@@ -80,6 +90,59 @@ class TrainConfig:
     detach_aug_ref: bool = True
 
 
+# ── Fold generation ───────────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class Fold:
+    index: int
+    train_range: Tuple[int, int]   # [start, end) row indices into actionable df
+    val_range: Tuple[int, int]
+    test_range: Tuple[int, int]
+
+
+def generate_folds(
+    n: int,
+    rows_per_day: int,
+    min_train_days: int,
+    val_days: int,
+    test_days: int,
+    step_days: int,
+) -> List[Fold]:
+    """Expanding-window walk-forward folds.
+
+    Each fold's train window grows from 0 to train_end; val and test windows
+    are fixed-size and strictly after the training data — no overlap.
+
+    Returns an empty list if the data is too short for even one fold.
+    """
+    min_train = min_train_days * rows_per_day
+    val_rows = val_days * rows_per_day
+    test_rows = test_days * rows_per_day
+    step = step_days * rows_per_day
+
+    folds: List[Fold] = []
+    train_end = min_train
+    fold_idx = 0
+
+    while train_end + val_rows + test_rows <= n:
+        val_end = train_end + val_rows
+        test_end = val_end + test_rows
+        folds.append(
+            Fold(
+                index=fold_idx,
+                train_range=(0, train_end),
+                val_range=(train_end, val_end),
+                test_range=(val_end, test_end),
+            )
+        )
+        train_end += step
+        fold_idx += 1
+
+    return folds
+
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+
 def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -89,7 +152,7 @@ def set_seed(seed: int) -> None:
 
 
 def obs_to_tensors(
-    obs: Mapping[str, np.ndarray], device: torch.device
+    obs: Dict[str, np.ndarray], device: torch.device
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     x = torch.as_tensor(obs["x"], dtype=torch.float32, device=device).unsqueeze(0)
     p = torch.as_tensor(obs["p"], dtype=torch.float32, device=device).unsqueeze(0)
@@ -155,7 +218,7 @@ def evaluate_policy(
     mkt_arr = np.asarray(market_returns, dtype=np.float64)
     sigma_arr = np.asarray(sigma_series, dtype=np.float64)
 
-    stats = {
+    return {
         "episode_length": float(len(rewards)),
         "reward_sum": float(reward_arr.sum()) if len(reward_arr) > 0 else 0.0,
         "reward_mean": float(reward_arr.mean()) if len(reward_arr) > 0 else 0.0,
@@ -166,8 +229,6 @@ def evaluate_policy(
         "mean_r_mkt_log": float(mkt_arr.mean()) if len(mkt_arr) > 0 else 0.0,
         "mean_sigma": float(sigma_arr.mean()) if len(sigma_arr) > 0 else 0.0,
     }
-
-    return stats
 
 
 def prefix_keys(d: Dict[str, float], prefix: str) -> Dict[str, float]:
@@ -181,7 +242,7 @@ def save_checkpoint(
     iteration: int,
     train_cfg: TrainConfig,
     model_cfg: ModelConfig,
-    data_meta: Dict[str, Any],
+    fold: Fold,
     feature_cols: Tuple[str, ...],
 ) -> None:
     payload = {
@@ -190,24 +251,28 @@ def save_checkpoint(
         "optimizer_state_dict": optimizer.state_dict(),
         "train_config": asdict(train_cfg),
         "model_config": asdict(model_cfg),
-        "data_meta": data_meta,
+        "fold": asdict(fold),
         "feature_cols": list(feature_cols),
     }
     torch.save(payload, path)
 
 
-def build_objects(cfg: TrainConfig) -> Dict[str, Any]:
-    window_rows = cfg.history_days * cfg.rows_per_day
+# ── Per-fold training ─────────────────────────────────────────────────────────
 
-    data_cfg = DataPipelineConfig(
-        csv_path=cfg.csv_path,
-        history_days=cfg.history_days,
-        sigma_days=cfg.sigma_days,
-        multi_day_return_days=cfg.multi_day_return_days,
-        rows_per_day=cfg.rows_per_day,
-        train_frac=cfg.train_frac,
-        val_frac=cfg.val_frac,
-    )
+def _train_one_fold(
+    fold: Fold,
+    df: pd.DataFrame,
+    feature_cols: Tuple[str, ...],
+    cfg: TrainConfig,
+    out_dir: Path,
+    device: torch.device,
+) -> Dict[str, Any]:
+    """Train a fresh model on one walk-forward fold.
+
+    Returns a dict with the best val stats and the corresponding test stats,
+    plus per-iteration metrics for logging.
+    """
+    window_rows = cfg.history_days * cfg.rows_per_day
 
     env_cfg = TradingEnvConfig(
         window_len=window_rows,
@@ -218,18 +283,40 @@ def build_objects(cfg: TrainConfig) -> Dict[str, Any]:
         sigma_is_std=cfg.sigma_is_std,
     )
 
-    bundle = build_trading_envs_from_csv(data_cfg, env_cfg)
-    train_env = bundle["train_env"]
-    val_env = bundle["val_env"]
-    test_env = bundle["test_env"]
-    feature_cols = tuple(bundle["feature_cols"])
-    feature_groups = bundle["feature_groups"]
-    data_meta = bundle["meta"]
+    scaler = fit_standardizer(df, fold.train_range[0], fold.train_range[1], feature_cols)
 
-    if data_meta["window_rows"] != window_rows:
-        raise ValueError(
-            f"Pipeline returned window_rows={data_meta['window_rows']}, but expected {window_rows}."
-        )
+    train_env = make_env_from_slice(
+        df=df,
+        core_start=fold.train_range[0],
+        core_end=fold.train_range[1],
+        feature_cols=feature_cols,
+        scaler=scaler,
+        env_cfg=env_cfg,
+        window_rows=window_rows,
+        timestamp_col="timestamp",
+    )
+    val_env = make_env_from_slice(
+        df=df,
+        core_start=fold.val_range[0],
+        core_end=fold.val_range[1],
+        feature_cols=feature_cols,
+        scaler=scaler,
+        env_cfg=env_cfg,
+        window_rows=window_rows,
+        timestamp_col="timestamp",
+    )
+    test_env = make_env_from_slice(
+        df=df,
+        core_start=fold.test_range[0],
+        core_end=fold.test_range[1],
+        feature_cols=feature_cols,
+        scaler=scaler,
+        env_cfg=env_cfg,
+        window_rows=window_rows,
+        timestamp_col="timestamp",
+    )
+
+    feature_groups = build_feature_groups(feature_cols)
 
     model_cfg = ModelConfig(
         seq_feature_dim=len(feature_cols),
@@ -237,7 +324,7 @@ def build_objects(cfg: TrainConfig) -> Dict[str, Any]:
         action_dim=len(train_env.action_grid),
         max_seq_len=window_rows,
     )
-    model = PPOSharedTransformerActorCritic(model_cfg)
+    model = PPOSharedTransformerActorCritic(model_cfg).to(device)
 
     aug_cfg = AugmentConfig(
         p_jitter=cfg.p_jitter,
@@ -265,7 +352,6 @@ def build_objects(cfg: TrainConfig) -> Dict[str, Any]:
         aug_value_coef=cfg.aug_value_coef,
         detach_aug_ref=cfg.detach_aug_ref,
     )
-
     trainer_cfg = PPOTrainerConfig(
         rollout_steps=cfg.rollout_steps,
         ppo_epochs=cfg.ppo_epochs,
@@ -277,7 +363,6 @@ def build_objects(cfg: TrainConfig) -> Dict[str, Any]:
         max_grad_norm=cfg.max_grad_norm,
         device=cfg.device,
     )
-
     trainer = PPOTrainer(
         model=model,
         env=train_env,
@@ -286,70 +371,14 @@ def build_objects(cfg: TrainConfig) -> Dict[str, Any]:
         augmenter=augmenter,
     )
 
-    return {
-        "bundle": bundle,
-        "train_env": train_env,
-        "val_env": val_env,
-        "test_env": test_env,
-        "feature_cols": feature_cols,
-        "data_meta": data_meta,
-        "model_cfg": model_cfg,
-        "model": model,
-        "augmenter": augmenter,
-        "trainer": trainer,
-    }
+    fold_dir = out_dir / f"fold_{fold.index:02d}"
+    fold_dir.mkdir(parents=True, exist_ok=True)
+    ckpt_dir = fold_dir / "checkpoints"
+    ckpt_dir.mkdir(exist_ok=True)
 
-
-def run_training(cfg: TrainConfig) -> None:
-    set_seed(cfg.seed)
-
-    if hasattr(torch, "set_float32_matmul_precision"):
-        torch.set_float32_matmul_precision("high")
-
-    out_dir = Path(cfg.output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    checkpoints_dir = out_dir / "checkpoints"
-    checkpoints_dir.mkdir(parents=True, exist_ok=True)
-
-    objs = build_objects(cfg)
-    train_env = objs["train_env"]
-    val_env = objs["val_env"]
-    test_env = objs["test_env"]
-    feature_cols = objs["feature_cols"]
-    data_meta = objs["data_meta"]
-    model_cfg = objs["model_cfg"]
-    model = objs["model"]
-    trainer = objs["trainer"]
-
-    device = torch.device(cfg.device)
-    model.to(device)
-
-    print("=" * 80)
-    print("Training setup")
-    print(f"device            : {cfg.device}")
-    print(f"csv_path          : {cfg.csv_path}")
-    print(f"output_dir        : {cfg.output_dir}")
-    print(f"feature_dim       : {len(feature_cols)}")
-    print(f"portfolio_dim     : 3")
-    print(f"action_dim        : {len(train_env.action_grid)}")
-    print(f"history_days      : {cfg.history_days}")
-    print(f"rows_per_day      : {cfg.rows_per_day}")
-    print(f"window_rows       : {data_meta['window_rows']}")
-    print(f"train_env_T       : {data_meta['train_env_T']}")
-    print(f"val_env_T         : {data_meta['val_env_T']}")
-    print(f"test_env_T        : {data_meta['test_env_T']}")
-    print(f"num_iterations    : {cfg.num_iterations}")
-    print("=" * 80)
-
-    with open(out_dir / "config.json", "w", encoding="utf-8") as f:
-        json.dump(asdict(cfg), f, indent=2)
-    with open(out_dir / "data_meta.json", "w", encoding="utf-8") as f:
-        json.dump(data_meta, f, indent=2)
-    with open(out_dir / "feature_cols.json", "w", encoding="utf-8") as f:
-        json.dump(list(feature_cols), f, indent=2)
-
-    records = []
+    records: List[Dict[str, float]] = []
     best_val_final_value = -float("inf")
+    best_test_stats: Dict[str, float] = {}
     best_iter = -1
 
     for iteration in range(1, cfg.num_iterations + 1):
@@ -378,13 +407,13 @@ def run_training(cfg: TrainConfig) -> None:
                 best_iter = iteration
 
                 save_checkpoint(
-                    path=out_dir / "best_model.pt",
+                    path=fold_dir / "best_model.pt",
                     model=model,
                     optimizer=trainer.optimizer,
                     iteration=iteration,
                     train_cfg=cfg,
                     model_cfg=model_cfg,
-                    data_meta=data_meta,
+                    fold=fold,
                     feature_cols=feature_cols,
                 )
 
@@ -400,20 +429,20 @@ def run_training(cfg: TrainConfig) -> None:
         records.append(row)
 
         save_checkpoint(
-            path=checkpoints_dir / f"iter_{iteration:04d}.pt",
+            path=ckpt_dir / f"iter_{iteration:04d}.pt",
             model=model,
             optimizer=trainer.optimizer,
             iteration=iteration,
             train_cfg=cfg,
             model_cfg=model_cfg,
-            data_meta=data_meta,
+            fold=fold,
             feature_cols=feature_cols,
         )
 
-        pd.DataFrame(records).to_csv(out_dir / "metrics.csv", index=False)
+        pd.DataFrame(records).to_csv(fold_dir / "metrics.csv", index=False)
 
         msg = (
-            f"[iter {iteration:04d}] "
+            f"[fold {fold.index:02d} | iter {iteration:04d}] "
             f"train_loss={train_stats.get('loss_total', float('nan')):.4f} "
             f"train_reward={train_stats.get('rollout_mean_reward', float('nan')):.6f}"
         )
@@ -424,11 +453,11 @@ def run_training(cfg: TrainConfig) -> None:
             )
         print(msg)
 
-    best_path = out_dir / "best_model.pt"
+    # Load best checkpoint and get final test score for this fold
+    best_path = fold_dir / "best_model.pt"
     if best_path.exists():
         ckpt = torch.load(best_path, map_location=device)
         model.load_state_dict(ckpt["model_state_dict"])
-
         final_test_stats = evaluate_policy(
             model=model,
             env=test_env,
@@ -436,33 +465,134 @@ def run_training(cfg: TrainConfig) -> None:
             deterministic=cfg.deterministic_eval,
             seed=cfg.seed,
         )
-        final_summary = {
-            "best_iteration": best_iter,
-            "best_val_final_value": best_val_final_value,
-            **prefix_keys(final_test_stats, "best_model_test/"),
+    else:
+        final_test_stats = {}
+
+    return {
+        "fold_index": fold.index,
+        "best_iter": best_iter,
+        "best_val_final_value": best_val_final_value,
+        "final_test_stats": final_test_stats,
+        "records": records,
+    }
+
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+def run_training(cfg: TrainConfig) -> None:
+    set_seed(cfg.seed)
+
+    if hasattr(torch, "set_float32_matmul_precision"):
+        torch.set_float32_matmul_precision("high")
+
+    out_dir = Path(cfg.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    with open(out_dir / "config.json", "w", encoding="utf-8") as f:
+        json.dump(asdict(cfg), f, indent=2)
+
+    data_cfg = DataPipelineConfig(
+        csv_path=cfg.csv_path,
+        history_days=cfg.history_days,
+        sigma_days=cfg.sigma_days,
+        multi_day_return_days=cfg.multi_day_return_days,
+        rows_per_day=cfg.rows_per_day,
+    )
+
+    df, feature_cols = load_actionable_df(data_cfg)
+    n = len(df)
+
+    folds = generate_folds(
+        n=n,
+        rows_per_day=cfg.rows_per_day,
+        min_train_days=cfg.min_train_days,
+        val_days=cfg.val_days,
+        test_days=cfg.test_days,
+        step_days=cfg.step_days,
+    )
+
+    if not folds:
+        raise ValueError(
+            f"Not enough data for any walk-forward fold. "
+            f"Actionable rows={n}; need at least "
+            f"{(cfg.min_train_days + cfg.val_days + cfg.test_days) * cfg.rows_per_day}."
+        )
+
+    device = torch.device(cfg.device)
+    window_rows = cfg.history_days * cfg.rows_per_day
+
+    print("=" * 80)
+    print("Walk-forward training setup")
+    print(f"device          : {cfg.device}")
+    print(f"csv_path        : {cfg.csv_path}")
+    print(f"output_dir      : {cfg.output_dir}")
+    print(f"actionable rows : {n}")
+    print(f"feature_dim     : {len(feature_cols)}")
+    print(f"window_rows     : {window_rows}")
+    print(f"num_folds       : {len(folds)}")
+    print(f"num_iterations  : {cfg.num_iterations} per fold")
+    for fold in folds:
+        print(
+            f"  fold {fold.index:02d}: "
+            f"train=[{fold.train_range[0]},{fold.train_range[1]}) "
+            f"val=[{fold.val_range[0]},{fold.val_range[1]}) "
+            f"test=[{fold.test_range[0]},{fold.test_range[1]})"
+        )
+    print("=" * 80)
+
+    fold_summaries = []
+    for fold in folds:
+        print(f"\n{'─'*40} Fold {fold.index} {'─'*40}")
+        result = _train_one_fold(
+            fold=fold,
+            df=df,
+            feature_cols=feature_cols,
+            cfg=cfg,
+            out_dir=out_dir,
+            device=device,
+        )
+        fold_summaries.append(result)
+
+    # Aggregate test metrics across folds
+    all_test = [r["final_test_stats"] for r in fold_summaries if r["final_test_stats"]]
+    if all_test:
+        agg = {
+            k: float(np.mean([s[k] for s in all_test if k in s]))
+            for k in all_test[0]
         }
     else:
-        final_summary = {
-            "best_iteration": -1,
-            "best_val_final_value": float("nan"),
-        }
+        agg = {}
+
+    final_summary = {
+        "num_folds": len(folds),
+        "folds": [
+            {
+                "fold_index": r["fold_index"],
+                "best_iter": r["best_iter"],
+                "best_val_final_value": r["best_val_final_value"],
+                **prefix_keys(r["final_test_stats"], "test/"),
+            }
+            for r in fold_summaries
+        ],
+        **prefix_keys(agg, "avg_test/"),
+    }
 
     with open(out_dir / "final_summary.json", "w", encoding="utf-8") as f:
         json.dump(final_summary, f, indent=2)
 
-    pd.DataFrame(records).to_csv(out_dir / "metrics.csv", index=False)
-
     print("=" * 80)
-    print("Training finished")
-    print(f"Best iteration      : {best_iter}")
-    print(f"Best val final value: {best_val_final_value:.6f}")
-    print(f"Artifacts saved to  : {out_dir}")
+    print("Walk-forward training finished")
+    print(f"Folds completed : {len(folds)}")
+    if agg:
+        print(f"Avg test final_value : {agg.get('final_value', float('nan')):.6f}")
+        print(f"Avg test max_drawdown: {agg.get('max_drawdown', float('nan')):.4f}")
+    print(f"Artifacts saved to: {out_dir}")
     print("=" * 80)
 
 
 def parse_args() -> TrainConfig:
     parser = argparse.ArgumentParser(
-        description="Train PPO + augmentation for ETH hourly trading."
+        description="Walk-forward PPO training for ETH hourly trading."
     )
     parser.add_argument("--csv_path", type=str, required=True)
     parser.add_argument("--output_dir", type=str, default="outputs/ppo_eth")
@@ -477,6 +607,11 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--sigma_days", type=int, default=20)
     parser.add_argument("--multi_day_return_days", type=int, default=7)
     parser.add_argument("--rows_per_day", type=int, default=24)
+
+    parser.add_argument("--min_train_days", type=int, default=365)
+    parser.add_argument("--val_days", type=int, default=90)
+    parser.add_argument("--test_days", type=int, default=90)
+    parser.add_argument("--step_days", type=int, default=90)
 
     parser.add_argument("--rollout_steps", type=int, default=512)
     parser.add_argument("--ppo_epochs", type=int, default=10)
@@ -496,6 +631,10 @@ def parse_args() -> TrainConfig:
         sigma_days=args.sigma_days,
         multi_day_return_days=args.multi_day_return_days,
         rows_per_day=args.rows_per_day,
+        min_train_days=args.min_train_days,
+        val_days=args.val_days,
+        test_days=args.test_days,
+        step_days=args.step_days,
         rollout_steps=args.rollout_steps,
         ppo_epochs=args.ppo_epochs,
         minibatch_size=args.minibatch_size,
