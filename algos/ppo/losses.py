@@ -102,6 +102,22 @@ def _compute_value_loss(
     raise ValueError(f"Unsupported value_loss_type: {loss_type}")
 
 
+def _safe_std(x: torch.Tensor) -> torch.Tensor:
+    if x.numel() <= 1:
+        return torch.zeros((), device=x.device, dtype=x.dtype)
+    return x.std(unbiased=False)
+
+
+def _compute_explained_variance(
+    y_pred: torch.Tensor,
+    y_true: torch.Tensor,
+) -> torch.Tensor:
+    var_y = torch.var(y_true, unbiased=False)
+    if torch.isnan(var_y) or var_y.item() < 1e-12:
+        return torch.zeros((), device=y_true.device, dtype=y_true.dtype)
+    return 1.0 - torch.var(y_true - y_pred, unbiased=False) / var_y
+
+
 def compute_ppo_aug_loss(
     model: nn.Module,
     batch: Mapping[str, Any],
@@ -111,7 +127,7 @@ def compute_ppo_aug_loss(
     x, p = _extract_obs(batch)
     actions = _extract_actions(batch)
     old_logprob = _extract_old_logprob(batch)
-    advantages = _extract_advantages(batch)
+    advantages_raw = _extract_advantages(batch)
     returns = _extract_returns(batch)
 
     if x.ndim != 3:
@@ -125,7 +141,7 @@ def compute_ppo_aug_loss(
     for name, tensor in {
         "actions": actions,
         "old_logprob": old_logprob,
-        "advantages": advantages,
+        "advantages": advantages_raw,
         "returns": returns,
     }.items():
         if tensor.shape[0] != B:
@@ -133,6 +149,7 @@ def compute_ppo_aug_loss(
                 f"{name} batch size mismatch: expected {B}, got {tensor.shape[0]}"
             )
 
+    advantages = advantages_raw
     if cfg.normalize_advantages:
         advantages = _normalize_advantages(advantages, eps=cfg.advantage_eps)
 
@@ -145,6 +162,12 @@ def compute_ppo_aug_loss(
     if values.ndim != 1:
         raise ValueError(f"Model values must have shape [B], got {tuple(values.shape)}")
 
+    if logits.shape[0] != B or values.shape[0] != B:
+        raise ValueError(
+            f"Model output batch mismatch: expected B={B}, "
+            f"got logits B={logits.shape[0]}, values B={values.shape[0]}"
+        )
+
     dist = Categorical(logits=logits)
     logprob = dist.log_prob(actions)  # [B]
     entropy = dist.entropy()  # [B]
@@ -152,17 +175,14 @@ def compute_ppo_aug_loss(
     log_ratio = logprob - old_logprob
     ratio = torch.exp(log_ratio)  # [B]
 
+    clipped_ratio = torch.clamp(ratio, 1.0 - cfg.clip_eps, 1.0 + cfg.clip_eps)
+
     surr1 = ratio * advantages
-    surr2 = torch.clamp(ratio, 1.0 - cfg.clip_eps, 1.0 + cfg.clip_eps) * advantages
+    surr2 = clipped_ratio * advantages
     policy_loss = -torch.min(surr1, surr2).mean()
 
     value_loss = _compute_value_loss(values, returns, loss_type=cfg.value_loss_type)
     entropy_bonus = entropy.mean()
-
-    # Useful diagnostics
-    with torch.no_grad():
-        approx_kl = (old_logprob - logprob).mean()
-        clipfrac = ((ratio - 1.0).abs() > cfg.clip_eps).float().mean()
 
     device = x.device
     aug_policy_loss = torch.zeros((), device=device)
@@ -200,19 +220,92 @@ def compute_ppo_aug_loss(
         + cfg.aug_value_coef * aug_value_loss
     )
 
+    with torch.no_grad():
+        # PPO diagnostics
+        approx_kl = ((ratio - 1.0) - log_ratio).mean()
+        sample_kl = (old_logprob - logprob).mean()
+        clipfrac = ((ratio - 1.0).abs() > cfg.clip_eps).float().mean()
+
+        # Entropy diagnostics
+        action_dim = logits.shape[-1]
+        if action_dim > 1:
+            max_entropy = torch.log(
+                torch.tensor(float(action_dim), device=device, dtype=logits.dtype)
+            )
+            normalized_entropy = entropy_bonus / max_entropy
+        else:
+            normalized_entropy = torch.zeros((), device=device, dtype=logits.dtype)
+
+        # Advantage diagnostics
+        adv_mean_raw = advantages_raw.mean()
+        adv_std_raw = _safe_std(advantages_raw)
+        adv_abs_mean_raw = advantages_raw.abs().mean()
+
+        adv_mean_used = advantages.mean()
+        adv_std_used = _safe_std(advantages)
+        adv_abs_mean_used = advantages.abs().mean()
+
+        # Value diagnostics
+        explained_var = _compute_explained_variance(values, returns)
+        value_pred_mean = values.mean()
+        value_pred_std = _safe_std(values)
+        return_mean = returns.mean()
+        return_std = _safe_std(returns)
+
+        # Ratio diagnostics
+        ratio_mean = ratio.mean()
+        ratio_std = _safe_std(ratio)
+        ratio_min = ratio.min()
+        ratio_max = ratio.max()
+
+        # Surrogate diagnostics
+        surr1_mean = surr1.mean()
+        surr2_mean = surr2.mean()
+        clipped_surr_mean = torch.min(surr1, surr2).mean()
+
+        # Action diagnostics
+        action_prob = torch.softmax(logits, dim=-1)
+        chosen_action_prob = action_prob.gather(1, actions.unsqueeze(1)).squeeze(1)
+        chosen_action_prob_mean = chosen_action_prob.mean()
+
     stats: Dict[str, torch.Tensor] = {
+        # Main losses
         "loss_total": total_loss.detach(),
-        "loss_policy": policy_loss.detach(),
-        "loss_value": value_loss.detach(),
+        "policy_loss": policy_loss.detach(),
+        "value_loss": value_loss.detach(),
         "entropy": entropy_bonus.detach(),
+        "aug_policy_loss": aug_policy_loss.detach(),
+        "aug_value_loss": aug_value_loss.detach(),
+        # PPO diagnostics
         "approx_kl": approx_kl.detach(),
+        "sample_kl": sample_kl.detach(),
         "clipfrac": clipfrac.detach(),
-        "mean_ratio": ratio.mean().detach(),
-        "mean_value": values.mean().detach(),
-        "mean_return": returns.mean().detach(),
-        "mean_advantage": advantages.mean().detach(),
-        "loss_aug_policy": aug_policy_loss.detach(),
-        "loss_aug_value": aug_value_loss.detach(),
+        # Ratio diagnostics
+        "ratio_mean": ratio_mean.detach(),
+        "ratio_std": ratio_std.detach(),
+        "ratio_min": ratio_min.detach(),
+        "ratio_max": ratio_max.detach(),
+        # Surrogate diagnostics
+        "surr1_mean": surr1_mean.detach(),
+        "surr2_mean": surr2_mean.detach(),
+        "clipped_surr_mean": clipped_surr_mean.detach(),
+        # Entropy diagnostics
+        "normalized_entropy": normalized_entropy.detach(),
+        # Value / return diagnostics
+        "value_pred_mean": value_pred_mean.detach(),
+        "value_pred_std": value_pred_std.detach(),
+        "return_mean": return_mean.detach(),
+        "return_std": return_std.detach(),
+        "explained_variance": explained_var.detach(),
+        # Advantage diagnostics
+        "adv_mean_raw": adv_mean_raw.detach(),
+        "adv_std_raw": adv_std_raw.detach(),
+        "adv_abs_mean_raw": adv_abs_mean_raw.detach(),
+        "adv_mean_used": adv_mean_used.detach(),
+        "adv_std_used": adv_std_used.detach(),
+        "adv_abs_mean_used": adv_abs_mean_used.detach(),
+        # Chosen action confidence
+        "chosen_action_prob_mean": chosen_action_prob_mean.detach(),
     }
 
     return total_loss, stats

@@ -75,6 +75,20 @@ def _compute_gae(
     return advantages, returns
 
 
+def _safe_tensor_std(x: torch.Tensor) -> float:
+    if x.numel() <= 1:
+        return 0.0
+    return float(x.std(unbiased=False).item())
+
+
+def _safe_np_mean(xs: List[float]) -> float:
+    return float(np.mean(xs)) if xs else 0.0
+
+
+def _safe_np_last(xs: List[float]) -> float:
+    return float(xs[-1]) if xs else 0.0
+
+
 class PPOTrainer:
     def __init__(
         self,
@@ -122,7 +136,7 @@ class PPOTrainer:
     @torch.no_grad()
     def _value_of_obs(self, obs: Mapping[str, np.ndarray]) -> torch.Tensor:
         x, p = _obs_to_tensors(obs, self.device)
-        _, value = self.model(x, p)  # value: [1]
+        _, value = self.model(x, p)  # [1]
         return value.squeeze(0)
 
     @torch.no_grad()
@@ -174,6 +188,7 @@ class PPOTrainer:
             if done:
                 finished_episode_returns.append(self._episode_return)
                 finished_episode_lengths.append(self._episode_length)
+
                 next_obs, next_info = self.env.reset()
                 self._episode_return = 0.0
                 self._episode_length = 0
@@ -212,28 +227,40 @@ class PPOTrainer:
             "returns": returns,
         }
 
+        action_unique, action_counts = torch.unique(action_batch, return_counts=True)
+        action_hist = {
+            f"action_frac_{int(a.item())}": float(c.item())
+            / float(action_batch.numel())
+            for a, c in zip(action_unique, action_counts)
+        }
+
         rollout_stats = {
             "rollout_steps": float(self.cfg.rollout_steps),
-            "rollout_mean_reward": reward_batch.mean().item(),
-            "rollout_mean_value": value_batch.mean().item(),
-            "rollout_num_dones": done_batch.sum().item(),
-            "episode_return_mean": (
-                float(np.mean(finished_episode_returns))
-                if finished_episode_returns
-                else 0.0
+            "rollout_num_dones": float(done_batch.sum().item()),
+            "rollout_done_frac": float(done_batch.float().mean().item()),
+            "rollout_mean_reward": float(reward_batch.mean().item()),
+            "rollout_reward_std": _safe_tensor_std(reward_batch),
+            "rollout_reward_sum": float(reward_batch.sum().item()),
+            "rollout_mean_value": float(value_batch.mean().item()),
+            "rollout_value_std": _safe_tensor_std(value_batch),
+            "rollout_last_value_bootstrap": float(last_value.item()),
+            "rollout_adv_mean": float(advantages.mean().item()),
+            "rollout_adv_std": _safe_tensor_std(advantages),
+            "rollout_adv_abs_mean": float(advantages.abs().mean().item()),
+            "rollout_return_mean": float(returns.mean().item()),
+            "rollout_return_std": _safe_tensor_std(returns),
+            "episode_return_mean": _safe_np_mean(finished_episode_returns),
+            "episode_length_mean": _safe_np_mean(
+                [float(x) for x in finished_episode_lengths]
             ),
-            "episode_length_mean": (
-                float(np.mean(finished_episode_lengths))
-                if finished_episode_lengths
-                else 0.0
+            "episode_return_last": _safe_np_last(finished_episode_returns),
+            "episode_length_last": _safe_np_last(
+                [float(x) for x in finished_episode_lengths]
             ),
-            "episode_return_last": (
-                float(finished_episode_returns[-1]) if finished_episode_returns else 0.0
-            ),
-            "episode_length_last": (
-                float(finished_episode_lengths[-1]) if finished_episode_lengths else 0.0
-            ),
+            "episode_return_running": float(self._episode_return),
+            "episode_length_running": float(self._episode_length),
         }
+        rollout_stats.update(action_hist)
 
         return batch, rollout_stats
 
@@ -256,6 +283,8 @@ class PPOTrainer:
             self.augmenter.train()
 
         stat_accumulator: Dict[str, List[float]] = {}
+        grad_norms: List[float] = []
+        num_updates = 0
 
         for _ in range(self.cfg.ppo_epochs):
             for minibatch in self._iterate_minibatches(batch):
@@ -269,30 +298,49 @@ class PPOTrainer:
                 )
 
                 loss.backward()
+
                 grad_norm = torch.nn.utils.clip_grad_norm_(
                     self.model.parameters(),
                     max_norm=self.cfg.max_grad_norm,
                 )
                 self.optimizer.step()
 
-                stats_float = {k: float(v.item()) for k, v in stats.items()}
-                stats_float["grad_norm"] = (
+                grad_norm_f = (
                     float(grad_norm.item())
                     if isinstance(grad_norm, torch.Tensor)
                     else float(grad_norm)
                 )
+                grad_norms.append(grad_norm_f)
+                num_updates += 1
 
+                stats_float = {k: float(v.item()) for k, v in stats.items()}
                 for k, v in stats_float.items():
                     stat_accumulator.setdefault(k, []).append(v)
 
         mean_stats = {k: float(np.mean(v)) for k, v in stat_accumulator.items()}
+
+        if grad_norms:
+            mean_stats["grad_norm"] = float(np.mean(grad_norms))
+            mean_stats["grad_norm_max"] = float(np.max(grad_norms))
+            mean_stats["grad_norm_min"] = float(np.min(grad_norms))
+        else:
+            mean_stats["grad_norm"] = 0.0
+            mean_stats["grad_norm_max"] = 0.0
+            mean_stats["grad_norm_min"] = 0.0
+
+        mean_stats["update_steps"] = float(num_updates)
+        mean_stats["ppo_epochs"] = float(self.cfg.ppo_epochs)
+        mean_stats["effective_minibatch_size"] = float(
+            min(self.cfg.minibatch_size, batch["actions"].shape[0])
+        )
+
         return mean_stats
 
     def train_iteration(self) -> Dict[str, float]:
         batch, rollout_stats = self.collect_rollout()
         update_stats = self.update(batch)
 
-        out = {}
+        out: Dict[str, float] = {}
         out.update(rollout_stats)
         out.update(update_stats)
         return out

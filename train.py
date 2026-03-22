@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 import torch
+from tqdm.auto import tqdm
 
 from augment.transforms import AugmentConfig, TradingAugmenter
 from algos import PPOLossConfig
@@ -23,6 +24,7 @@ from datasets import (
 )
 from envs import TradingEnvConfig
 from models import ModelConfig, PPOSharedTransformerActorCritic
+from utils import TensorBoardConfig, TensorBoardLogger
 
 
 @dataclass(frozen=True)
@@ -44,10 +46,10 @@ class TrainConfig:
     rows_per_day: int = 24
 
     # Walk-forward split parameters (all in days; converted to rows internally)
-    min_train_days: int = 365   # minimum training window (expanding)
-    val_days: int = 90          # validation window per fold
-    test_days: int = 90         # test window per fold
-    step_days: int = 90         # how many days to advance per fold
+    min_train_days: int = 365
+    val_days: int = 90
+    test_days: int = 90
+    step_days: int = 90
 
     alpha: float = 0.001
     lambda_risk: float = 0.1
@@ -89,13 +91,27 @@ class TrainConfig:
     aug_value_coef: float = 0.25
     detach_aug_ref: bool = True
 
+    # Validation model-selection score
+    val_reward_coef: float = 1.0
+    val_mdd_coef: float = 0.25
+    val_turnover_coef: float = 0.05
+
+    # Eval diagnostics
+    trade_eps: float = 1e-8
+    high_exposure_threshold: float = 0.75
+
+    # TensorBoard
+    enable_tensorboard: bool = True
+    tensorboard_flush_every: int = 1
+
 
 # ── Fold generation ───────────────────────────────────────────────────────────
+
 
 @dataclass(frozen=True)
 class Fold:
     index: int
-    train_range: Tuple[int, int]   # [start, end) row indices into actionable df
+    train_range: Tuple[int, int]
     val_range: Tuple[int, int]
     test_range: Tuple[int, int]
 
@@ -108,13 +124,7 @@ def generate_folds(
     test_days: int,
     step_days: int,
 ) -> List[Fold]:
-    """Expanding-window walk-forward folds.
-
-    Each fold's train window grows from 0 to train_end; val and test windows
-    are fixed-size and strictly after the training data — no overlap.
-
-    Returns an empty list if the data is too short for even one fold.
-    """
+    """Expanding-window walk-forward folds."""
     min_train = min_train_days * rows_per_day
     val_rows = val_days * rows_per_day
     test_rows = test_days * rows_per_day
@@ -143,6 +153,7 @@ def generate_folds(
 
 # ── Utilities ─────────────────────────────────────────────────────────────────
 
+
 def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -167,11 +178,60 @@ def compute_max_drawdown(values: np.ndarray) -> float:
     return float(np.max(drawdowns))
 
 
+def _np_mean(x: np.ndarray) -> float:
+    return float(x.mean()) if x.size > 0 else 0.0
+
+
+def _np_std(x: np.ndarray) -> float:
+    return float(x.std()) if x.size > 0 else 0.0
+
+
+def _compute_sharpe_like(x: np.ndarray) -> float:
+    if x.size <= 1:
+        return 0.0
+    std = float(x.std())
+    if std < 1e-12:
+        return 0.0
+    return float(x.mean() / std)
+
+
+def _compute_ann_sharpe_like(x: np.ndarray, periods_per_year: int) -> float:
+    base = _compute_sharpe_like(x)
+    if periods_per_year <= 0:
+        return 0.0
+    return float(base * np.sqrt(periods_per_year))
+
+
+def _compute_eval_score(stats: Dict[str, float], cfg: TrainConfig) -> float:
+    return float(
+        cfg.val_reward_coef * stats.get("reward_sum", 0.0)
+        - cfg.val_mdd_coef * stats.get("max_drawdown", 0.0)
+        - cfg.val_turnover_coef * stats.get("avg_turnover", 0.0)
+    )
+
+
+def _aggregate_metric_dicts(metric_dicts: List[Dict[str, float]]) -> Dict[str, float]:
+    if not metric_dicts:
+        return {}
+    keys = sorted(set().union(*(d.keys() for d in metric_dicts)))
+    out: Dict[str, float] = {}
+    for k in keys:
+        vals = [float(d[k]) for d in metric_dicts if k in d]
+        if vals:
+            out[k] = float(np.mean(vals))
+    return out
+
+
+def prefix_keys(d: Dict[str, float], prefix: str) -> Dict[str, float]:
+    return {f"{prefix}{k}": v for k, v in d.items()}
+
+
 @torch.no_grad()
 def evaluate_policy(
     model: PPOSharedTransformerActorCritic,
     env: Any,
     device: torch.device,
+    cfg: TrainConfig,
     deterministic: bool = True,
     seed: Optional[int] = None,
 ) -> Dict[str, float]:
@@ -179,17 +239,18 @@ def evaluate_policy(
 
     obs, info = env.reset(seed=seed, options={"random_start": False})
 
-    rewards = []
-    values = [float(info["V"])]
-    weights = []
-    turnovers = []
-    market_returns = []
-    sigma_series = []
+    rewards: List[float] = []
+    values: List[float] = [float(info["V"])]
+    weights: List[float] = []
+    turnovers: List[float] = []
+    market_returns: List[float] = []
+    sigma_series: List[float] = []
+    critic_values: List[float] = []
 
     done = False
     while not done:
         x, p = obs_to_tensors(obs, device)
-        logits, value = model(x, p)
+        logits, critic_value = model(x, p)
 
         if deterministic:
             action = torch.argmax(logits, dim=-1)
@@ -208,6 +269,7 @@ def evaluate_policy(
         turnovers.append(abs(float(step_info["delta_w"])))
         market_returns.append(float(step_info["r_mkt_log"]))
         sigma_series.append(float(step_info["sigma"]))
+        critic_values.append(float(critic_value.item()))
 
         obs = next_obs
 
@@ -217,22 +279,89 @@ def evaluate_policy(
     weight_arr = np.asarray(weights, dtype=np.float64)
     mkt_arr = np.asarray(market_returns, dtype=np.float64)
     sigma_arr = np.asarray(sigma_series, dtype=np.float64)
+    critic_arr = np.asarray(critic_values, dtype=np.float64)
 
-    return {
+    initial_value = float(value_arr[0]) if value_arr.size > 0 else 0.0
+    final_value = float(value_arr[-1]) if value_arr.size > 0 else 0.0
+    value_return = (
+        float(final_value / max(initial_value, 1e-12) - 1.0)
+        if value_arr.size > 0
+        else 0.0
+    )
+
+    value_logret_arr = (
+        np.diff(np.log(np.clip(value_arr, 1e-12, None)))
+        if value_arr.size > 1
+        else np.asarray([], dtype=np.float64)
+    )
+
+    num_trades = (
+        float(np.sum(turnover_arr > cfg.trade_eps)) if turnover_arr.size > 0 else 0.0
+    )
+    fraction_in_market = (
+        float(np.mean(weight_arr > cfg.trade_eps)) if weight_arr.size > 0 else 0.0
+    )
+    fraction_high_exposure = (
+        float(np.mean(weight_arr >= cfg.high_exposure_threshold))
+        if weight_arr.size > 0
+        else 0.0
+    )
+    fraction_flat = (
+        float(np.mean(weight_arr <= cfg.trade_eps)) if weight_arr.size > 0 else 0.0
+    )
+
+    buy_hold_log_return = float(mkt_arr.sum()) if mkt_arr.size > 0 else 0.0
+    buy_hold_final_value = float(initial_value * np.exp(buy_hold_log_return))
+    buy_hold_value_return = (
+        float(buy_hold_final_value / max(initial_value, 1e-12) - 1.0)
+        if initial_value > 0.0
+        else 0.0
+    )
+
+    stats = {
         "episode_length": float(len(rewards)),
-        "reward_sum": float(reward_arr.sum()) if len(reward_arr) > 0 else 0.0,
-        "reward_mean": float(reward_arr.mean()) if len(reward_arr) > 0 else 0.0,
-        "final_value": float(value_arr[-1]) if len(value_arr) > 0 else 0.0,
+        "reward_sum": float(reward_arr.sum()) if reward_arr.size > 0 else 0.0,
+        "reward_mean": _np_mean(reward_arr),
+        "reward_std": _np_std(reward_arr),
+        "reward_sharpe_like": _compute_sharpe_like(reward_arr),
+        "final_value": final_value,
+        "value_return": value_return,
+        "value_logret_mean": _np_mean(value_logret_arr),
+        "value_logret_std": _np_std(value_logret_arr),
+        "value_sharpe_like": _compute_sharpe_like(value_logret_arr),
+        "value_ann_sharpe_like": _compute_ann_sharpe_like(
+            value_logret_arr, periods_per_year=cfg.rows_per_day * 365
+        ),
         "max_drawdown": compute_max_drawdown(value_arr),
-        "avg_weight": float(weight_arr.mean()) if len(weight_arr) > 0 else 0.0,
-        "avg_turnover": float(turnover_arr.mean()) if len(turnover_arr) > 0 else 0.0,
-        "mean_r_mkt_log": float(mkt_arr.mean()) if len(mkt_arr) > 0 else 0.0,
-        "mean_sigma": float(sigma_arr.mean()) if len(sigma_arr) > 0 else 0.0,
+        "calmar_like": (
+            float(value_return / max(compute_max_drawdown(value_arr), 1e-12))
+            if value_arr.size > 0
+            else 0.0
+        ),
+        "avg_weight": _np_mean(weight_arr),
+        "weight_std": _np_std(weight_arr),
+        "max_weight": float(weight_arr.max()) if weight_arr.size > 0 else 0.0,
+        "min_weight": float(weight_arr.min()) if weight_arr.size > 0 else 0.0,
+        "avg_turnover": _np_mean(turnover_arr),
+        "turnover_std": _np_std(turnover_arr),
+        "max_turnover": float(turnover_arr.max()) if turnover_arr.size > 0 else 0.0,
+        "avg_abs_delta_w": _np_mean(turnover_arr),
+        "num_trades": num_trades,
+        "fraction_in_market": fraction_in_market,
+        "fraction_high_exposure": fraction_high_exposure,
+        "fraction_flat": fraction_flat,
+        "mean_r_mkt_log": _np_mean(mkt_arr),
+        "market_log_return_sum": float(mkt_arr.sum()) if mkt_arr.size > 0 else 0.0,
+        "buy_hold_final_value": buy_hold_final_value,
+        "buy_hold_value_return": buy_hold_value_return,
+        "excess_value_return_vs_bh": float(value_return - buy_hold_value_return),
+        "mean_sigma": _np_mean(sigma_arr),
+        "sigma_std": _np_std(sigma_arr),
+        "critic_value_mean": _np_mean(critic_arr),
+        "critic_value_std": _np_std(critic_arr),
     }
-
-
-def prefix_keys(d: Dict[str, float], prefix: str) -> Dict[str, float]:
-    return {f"{prefix}{k}": v for k, v in d.items()}
+    stats["score"] = _compute_eval_score(stats, cfg)
+    return stats
 
 
 def save_checkpoint(
@@ -244,6 +373,7 @@ def save_checkpoint(
     model_cfg: ModelConfig,
     fold: Fold,
     feature_cols: Tuple[str, ...],
+    extra_state: Optional[Dict[str, Any]] = None,
 ) -> None:
     payload = {
         "iteration": iteration,
@@ -254,10 +384,13 @@ def save_checkpoint(
         "fold": asdict(fold),
         "feature_cols": list(feature_cols),
     }
+    if extra_state is not None:
+        payload["extra_state"] = extra_state
     torch.save(payload, path)
 
 
 # ── Per-fold training ─────────────────────────────────────────────────────────
+
 
 def _train_one_fold(
     fold: Fold,
@@ -266,12 +399,9 @@ def _train_one_fold(
     cfg: TrainConfig,
     out_dir: Path,
     device: torch.device,
+    tb_logger: Optional[TensorBoardLogger] = None,
 ) -> Dict[str, Any]:
-    """Train a fresh model on one walk-forward fold.
-
-    Returns a dict with the best val stats and the corresponding test stats,
-    plus per-iteration metrics for logging.
-    """
+    """Train a fresh model on one walk-forward fold."""
     window_rows = cfg.history_days * cfg.rows_per_day
 
     env_cfg = TradingEnvConfig(
@@ -283,7 +413,9 @@ def _train_one_fold(
         sigma_is_std=cfg.sigma_is_std,
     )
 
-    scaler = fit_standardizer(df, fold.train_range[0], fold.train_range[1], feature_cols)
+    scaler = fit_standardizer(
+        df, fold.train_range[0], fold.train_range[1], feature_cols
+    )
 
     train_env = make_env_from_slice(
         df=df,
@@ -377,13 +509,24 @@ def _train_one_fold(
     ckpt_dir.mkdir(exist_ok=True)
 
     records: List[Dict[str, float]] = []
-    best_val_final_value = -float("inf")
+    best_val_score = -float("inf")
+    best_val_stats: Dict[str, float] = {}
     best_test_stats: Dict[str, float] = {}
     best_iter = -1
 
-    for iteration in range(1, cfg.num_iterations + 1):
+    pbar = tqdm(
+        range(1, cfg.num_iterations + 1),
+        desc=f"Fold {fold.index:02d}",
+        leave=True,
+        dynamic_ncols=True,
+    )
+
+    for iteration in pbar:
         train_stats = trainer.train_iteration()
-        row: Dict[str, float] = {"iteration": float(iteration)}
+        row: Dict[str, float] = {
+            "iteration": float(iteration),
+            "is_best": 0.0,
+        }
         row.update(prefix_keys(train_stats, "train/"))
 
         do_eval = (
@@ -392,19 +535,26 @@ def _train_one_fold(
             or (iteration == cfg.num_iterations)
         )
 
+        val_stats: Dict[str, float] = {}
+        test_at_best_stats_for_tb: Optional[Dict[str, float]] = None
+
         if do_eval:
             val_stats = evaluate_policy(
                 model=model,
                 env=val_env,
                 device=device,
+                cfg=cfg,
                 deterministic=cfg.deterministic_eval,
                 seed=cfg.seed,
             )
             row.update(prefix_keys(val_stats, "val/"))
 
-            if val_stats["final_value"] > best_val_final_value:
-                best_val_final_value = val_stats["final_value"]
+            current_val_score = val_stats["score"]
+            if current_val_score > best_val_score:
+                best_val_score = current_val_score
                 best_iter = iteration
+                best_val_stats = dict(val_stats)
+                row["is_best"] = 1.0
 
                 save_checkpoint(
                     path=fold_dir / "best_model.pt",
@@ -415,16 +565,23 @@ def _train_one_fold(
                     model_cfg=model_cfg,
                     fold=fold,
                     feature_cols=feature_cols,
+                    extra_state={
+                        "best_iter": best_iter,
+                        "best_val_score": best_val_score,
+                        "best_val_stats": best_val_stats,
+                    },
                 )
 
                 best_test_stats = evaluate_policy(
                     model=model,
                     env=test_env,
                     device=device,
+                    cfg=cfg,
                     deterministic=cfg.deterministic_eval,
                     seed=cfg.seed,
                 )
                 row.update(prefix_keys(best_test_stats, "test_at_best/"))
+                test_at_best_stats_for_tb = best_test_stats
 
         records.append(row)
 
@@ -441,19 +598,47 @@ def _train_one_fold(
 
         pd.DataFrame(records).to_csv(fold_dir / "metrics.csv", index=False)
 
-        msg = (
-            f"[fold {fold.index:02d} | iter {iteration:04d}] "
-            f"train_loss={train_stats.get('loss_total', float('nan')):.4f} "
-            f"train_reward={train_stats.get('rollout_mean_reward', float('nan')):.6f}"
-        )
-        if do_eval:
-            msg += (
-                f" | val_final_V={row.get('val/final_value', float('nan')):.6f}"
-                f" val_mdd={row.get('val/max_drawdown', float('nan')):.4f}"
+        if tb_logger is not None:
+            tb_logger.log_train_iteration(
+                fold_index=fold.index,
+                iteration=iteration,
+                train_stats=train_stats,
             )
-        print(msg)
 
-    # Load best checkpoint and get final test score for this fold
+            tb_logger.log_best_marker(
+                fold_index=fold.index,
+                iteration=iteration,
+                is_best=bool(row["is_best"] > 0.5),
+            )
+
+            if do_eval:
+                tb_logger.log_eval_iteration(
+                    split="val",
+                    fold_index=fold.index,
+                    iteration=iteration,
+                    eval_stats=val_stats,
+                )
+
+            if test_at_best_stats_for_tb is not None:
+                tb_logger.log_eval_iteration(
+                    split="test_at_best",
+                    fold_index=fold.index,
+                    iteration=iteration,
+                    eval_stats=test_at_best_stats_for_tb,
+                )
+
+        postfix = {
+            "best_val_score": f"{best_val_score:.4f}" if best_iter >= 0 else "nan",
+            "rr": f"{train_stats.get('rollout_mean_reward', float('nan')):.4f}",
+        }
+        if do_eval:
+            postfix["val_score"] = f"{val_stats.get('score', float('nan')):.4f}"
+            postfix["val_V"] = f"{val_stats.get('final_value', float('nan')):.4f}"
+            postfix["val_mdd"] = f"{val_stats.get('max_drawdown', float('nan')):.4f}"
+        pbar.set_postfix(postfix)
+
+    pbar.close()
+
     best_path = fold_dir / "best_model.pt"
     if best_path.exists():
         ckpt = torch.load(best_path, map_location=device)
@@ -462,22 +647,43 @@ def _train_one_fold(
             model=model,
             env=test_env,
             device=device,
+            cfg=cfg,
             deterministic=cfg.deterministic_eval,
             seed=cfg.seed,
         )
     else:
         final_test_stats = {}
 
+    if tb_logger is not None:
+        tb_logger.log_fold_summary(
+            fold_index=fold.index,
+            best_iter=best_iter,
+            best_val_stats=best_val_stats,
+            final_test_stats=final_test_stats,
+        )
+
+    print(
+        f"Fold {fold.index:02d} done | "
+        f"best_iter={best_iter} "
+        f"best_val_score={best_val_score:.6f} "
+        f"best_val_V={best_val_stats.get('final_value', float('nan')):.6f} "
+        f"test_V={final_test_stats.get('final_value', float('nan')):.6f} "
+        f"test_mdd={final_test_stats.get('max_drawdown', float('nan')):.4f}"
+    )
+
     return {
         "fold_index": fold.index,
         "best_iter": best_iter,
-        "best_val_final_value": best_val_final_value,
+        "best_val_score": best_val_score,
+        "best_val_stats": best_val_stats,
+        "test_at_best_stats": best_test_stats,
         "final_test_stats": final_test_stats,
         "records": records,
     }
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
+
 
 def run_training(cfg: TrainConfig) -> None:
     set_seed(cfg.seed)
@@ -487,6 +693,14 @@ def run_training(cfg: TrainConfig) -> None:
 
     out_dir = Path(cfg.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    tb_logger = TensorBoardLogger(
+        out_dir=out_dir,
+        cfg=TensorBoardConfig(
+            enabled=cfg.enable_tensorboard,
+            flush_every=cfg.tensorboard_flush_every,
+        ),
+    )
 
     with open(out_dir / "config.json", "w", encoding="utf-8") as f:
         json.dump(asdict(cfg), f, indent=2)
@@ -523,14 +737,21 @@ def run_training(cfg: TrainConfig) -> None:
 
     print("=" * 80)
     print("Walk-forward training setup")
-    print(f"device          : {cfg.device}")
-    print(f"csv_path        : {cfg.csv_path}")
-    print(f"output_dir      : {cfg.output_dir}")
-    print(f"actionable rows : {n}")
-    print(f"feature_dim     : {len(feature_cols)}")
-    print(f"window_rows     : {window_rows}")
-    print(f"num_folds       : {len(folds)}")
-    print(f"num_iterations  : {cfg.num_iterations} per fold")
+    print(f"device              : {cfg.device}")
+    print(f"csv_path            : {cfg.csv_path}")
+    print(f"output_dir          : {cfg.output_dir}")
+    print(f"actionable rows     : {n}")
+    print(f"feature_dim         : {len(feature_cols)}")
+    print(f"window_rows         : {window_rows}")
+    print(f"num_folds           : {len(folds)}")
+    print(f"num_iterations      : {cfg.num_iterations} per fold")
+    print(f"tensorboard         : {cfg.enable_tensorboard}")
+    print(
+        "val_score           : "
+        f"{cfg.val_reward_coef:.3f} * reward_sum "
+        f"- {cfg.val_mdd_coef:.3f} * max_drawdown "
+        f"- {cfg.val_turnover_coef:.3f} * avg_turnover"
+    )
     for fold in folds:
         print(
             f"  fold {fold.index:02d}: "
@@ -541,27 +762,28 @@ def run_training(cfg: TrainConfig) -> None:
     print("=" * 80)
 
     fold_summaries = []
-    for fold in folds:
-        print(f"\n{'─'*40} Fold {fold.index} {'─'*40}")
-        result = _train_one_fold(
-            fold=fold,
-            df=df,
-            feature_cols=feature_cols,
-            cfg=cfg,
-            out_dir=out_dir,
-            device=device,
-        )
-        fold_summaries.append(result)
+    try:
+        for fold in folds:
+            print(f"\n{'─' * 40} Fold {fold.index} {'─' * 40}")
+            result = _train_one_fold(
+                fold=fold,
+                df=df,
+                feature_cols=feature_cols,
+                cfg=cfg,
+                out_dir=out_dir,
+                device=device,
+                tb_logger=tb_logger,
+            )
+            fold_summaries.append(result)
+    finally:
+        # close later after run_summary logging if possible
+        pass
 
-    # Aggregate test metrics across folds
+    all_best_val = [r["best_val_stats"] for r in fold_summaries if r["best_val_stats"]]
     all_test = [r["final_test_stats"] for r in fold_summaries if r["final_test_stats"]]
-    if all_test:
-        agg = {
-            k: float(np.mean([s[k] for s in all_test if k in s]))
-            for k in all_test[0]
-        }
-    else:
-        agg = {}
+
+    agg_best_val = _aggregate_metric_dicts(all_best_val)
+    agg_test = _aggregate_metric_dicts(all_test)
 
     final_summary = {
         "num_folds": len(folds),
@@ -569,24 +791,47 @@ def run_training(cfg: TrainConfig) -> None:
             {
                 "fold_index": r["fold_index"],
                 "best_iter": r["best_iter"],
-                "best_val_final_value": r["best_val_final_value"],
+                "best_val_score": r["best_val_score"],
+                **prefix_keys(r["best_val_stats"], "best_val/"),
                 **prefix_keys(r["final_test_stats"], "test/"),
             }
             for r in fold_summaries
         ],
-        **prefix_keys(agg, "avg_test/"),
+        **prefix_keys(agg_best_val, "avg_best_val/"),
+        **prefix_keys(agg_test, "avg_test/"),
     }
 
     with open(out_dir / "final_summary.json", "w", encoding="utf-8") as f:
         json.dump(final_summary, f, indent=2)
 
+    if tb_logger is not None:
+        tb_logger.log_run_summary(
+            avg_best_val_stats=agg_best_val,
+            avg_test_stats=agg_test,
+            step=len(folds),
+        )
+        tb_logger.close()
+
     print("=" * 80)
     print("Walk-forward training finished")
-    print(f"Folds completed : {len(folds)}")
-    if agg:
-        print(f"Avg test final_value : {agg.get('final_value', float('nan')):.6f}")
-        print(f"Avg test max_drawdown: {agg.get('max_drawdown', float('nan')):.4f}")
-    print(f"Artifacts saved to: {out_dir}")
+    print(f"Folds completed       : {len(folds)}")
+    if agg_best_val:
+        print(f"Avg best val score    : {agg_best_val.get('score', float('nan')):.6f}")
+        print(
+            f"Avg best val V        : {agg_best_val.get('final_value', float('nan')):.6f}"
+        )
+        print(
+            f"Avg best val MDD      : {agg_best_val.get('max_drawdown', float('nan')):.4f}"
+        )
+    if agg_test:
+        print(
+            f"Avg test final_value  : {agg_test.get('final_value', float('nan')):.6f}"
+        )
+        print(
+            f"Avg test max_drawdown : {agg_test.get('max_drawdown', float('nan')):.4f}"
+        )
+        print(f"Avg test score        : {agg_test.get('score', float('nan')):.6f}")
+    print(f"Artifacts saved to    : {out_dir}")
     print("=" * 80)
 
 
@@ -594,10 +839,14 @@ def parse_args() -> TrainConfig:
     parser = argparse.ArgumentParser(
         description="Walk-forward PPO training for ETH hourly trading."
     )
-    parser.add_argument("--csv_path", type=str, required=True)
+    parser.add_argument(
+        "--csv_path",
+        type=str,
+        default="data/gap_repair/eth_metrics_midway_conservative_fill.csv",
+    )
     parser.add_argument("--output_dir", type=str, default="outputs/ppo_eth")
     parser.add_argument(
-        "--device", type=str, default=("cuda" if torch.cuda.is_available() else "cpu")
+        "--device", type=str, default=("cuda:1" if torch.cuda.is_available() else "cpu")
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num_iterations", type=int, default=200)
@@ -617,6 +866,22 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--ppo_epochs", type=int, default=10)
     parser.add_argument("--minibatch_size", type=int, default=64)
     parser.add_argument("--learning_rate", type=float, default=3e-4)
+
+    parser.add_argument("--val_reward_coef", type=float, default=1.0)
+    parser.add_argument("--val_mdd_coef", type=float, default=0.25)
+    parser.add_argument("--val_turnover_coef", type=float, default=0.05)
+
+    parser.add_argument(
+        "--disable_tensorboard",
+        action="store_true",
+        help="Disable TensorBoard logging.",
+    )
+    parser.add_argument(
+        "--tensorboard_flush_every",
+        type=int,
+        default=1,
+        help="Flush TensorBoard writer every N logging calls.",
+    )
 
     args = parser.parse_args()
 
@@ -639,6 +904,11 @@ def parse_args() -> TrainConfig:
         ppo_epochs=args.ppo_epochs,
         minibatch_size=args.minibatch_size,
         learning_rate=args.learning_rate,
+        val_reward_coef=args.val_reward_coef,
+        val_mdd_coef=args.val_mdd_coef,
+        val_turnover_coef=args.val_turnover_coef,
+        enable_tensorboard=not args.disable_tensorboard,
+        tensorboard_flush_every=args.tensorboard_flush_every,
     )
 
 
