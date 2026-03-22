@@ -13,6 +13,7 @@ now includes:
 
 - `scripts/check_hourly_intervals.py`
 - `scripts/repair_hourly_gaps.py`
+- `scripts/build_repaired_midway.py`
 
 ### Two repair versions
 
@@ -101,6 +102,20 @@ Validate the outputs:
 .venv/bin/python scripts/check_hourly_intervals.py data/gap_repair/eth_metrics_combined_conservative_fill.csv
 ```
 
+Build model-ready repaired midway CSVs that retain all engineered log columns:
+
+```bash
+.venv/bin/python scripts/build_repaired_midway.py \
+  --input-csv data/metrics/eth_metrics_combined_macro.csv \
+  --output-dir data/gap_repair \
+  --trim-before 2016-05-26T00:00:00Z
+```
+
+This writes:
+
+- `data/gap_repair/eth_metrics_midway_average_fill.csv`
+- `data/gap_repair/eth_metrics_midway_conservative_fill.csv`
+
 ### Recommendation
 
 For this repo, `conservative` is the better default.
@@ -121,6 +136,7 @@ changes. `average` is still useful as a comparison baseline.
 
 - `scripts/check_hourly_intervals.py`
 - `scripts/repair_hourly_gaps.py`
+- `scripts/build_repaired_midway.py`
 
 ### 两种修复版本
 
@@ -207,6 +223,20 @@ changes. `average` is still useful as a comparison baseline.
 .venv/bin/python scripts/check_hourly_intervals.py data/gap_repair/eth_metrics_combined_average_fill.csv
 .venv/bin/python scripts/check_hourly_intervals.py data/gap_repair/eth_metrics_combined_conservative_fill.csv
 ```
+
+如果你需要的是**保留全部 midway 特征列**的模型输入版数据，可以直接运行：
+
+```bash
+.venv/bin/python scripts/build_repaired_midway.py \
+  --input-csv data/metrics/eth_metrics_combined_macro.csv \
+  --output-dir data/gap_repair \
+  --trim-before 2016-05-26T00:00:00Z
+```
+
+它会输出：
+
+- `data/gap_repair/eth_metrics_midway_average_fill.csv`
+- `data/gap_repair/eth_metrics_midway_conservative_fill.csv`
 
 ### 建议
 

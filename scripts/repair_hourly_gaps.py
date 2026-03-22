@@ -94,6 +94,52 @@ def _parse_timestamp_column(series: pd.Series) -> pd.Series:
     return parsed
 
 
+def _timestamps_look_broken(series: pd.Series) -> bool:
+    valid = series.dropna()
+    if valid.empty:
+        return True
+    if valid.nunique() <= 1:
+        return True
+    # Modern crypto history should not land near Unix epoch after parsing.
+    return bool(valid.max() < pd.Timestamp("2000-01-01", tz="UTC"))
+
+
+def _repair_broken_timestamps(csv_path: Path, df: pd.DataFrame) -> pd.DataFrame:
+    if "timestamp" not in df.columns:
+        return df
+
+    parsed = _parse_timestamp_column(df["timestamp"])
+    if not _timestamps_look_broken(parsed):
+        df = df.copy()
+        df["timestamp"] = parsed
+        return df
+
+    candidate = None
+    if csv_path.name.endswith("_macro.csv"):
+        candidate = csv_path.with_name(csv_path.name.replace("_macro.csv", ".csv"))
+
+    if candidate is None or not candidate.exists():
+        df = df.copy()
+        df["timestamp"] = parsed
+        return df
+
+    ref = pd.read_csv(candidate, usecols=["timestamp"])
+    if len(ref) != len(df):
+        df = df.copy()
+        df["timestamp"] = parsed
+        return df
+
+    ref_ts = _parse_timestamp_column(ref["timestamp"])
+    if ref_ts.isna().any() or _timestamps_look_broken(ref_ts):
+        df = df.copy()
+        df["timestamp"] = parsed
+        return df
+
+    df = df.copy()
+    df["timestamp"] = ref_ts
+    return df
+
+
 def _load_frame(csv_path: Path) -> pd.DataFrame:
     if not csv_path.exists():
         raise FileNotFoundError(f"Input CSV not found: {csv_path}")
@@ -104,8 +150,7 @@ def _load_frame(csv_path: Path) -> pd.DataFrame:
     if df.empty:
         raise ValueError(f"Input CSV is empty: {csv_path}")
 
-    df = df.copy()
-    df["timestamp"] = _parse_timestamp_column(df["timestamp"])
+    df = _repair_broken_timestamps(csv_path, df)
     if df["timestamp"].isna().any():
         bad_count = int(df["timestamp"].isna().sum())
         raise ValueError(f"Found {bad_count} invalid timestamps in {csv_path}")
@@ -315,6 +360,42 @@ def _output_path(output_dir: Path, input_csv: Path, method: str) -> Path:
     return output_dir / f"{stem}_{method}_fill.csv"
 
 
+def repair_csv(
+    input_csv: Path,
+    output_dir: Path,
+    methods: Sequence[str],
+    trim_before: Optional[pd.Timestamp],
+) -> List[RepairSummary]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    df = _load_frame(input_csv)
+
+    summaries: List[RepairSummary] = []
+    for method in methods:
+        repaired, input_rows, trimmed_rows, original_gap_count = _repair(
+            df=df,
+            method=method,
+            trim_before=trim_before,
+        )
+        _validate_hourly(repaired)
+        output_path = _output_path(output_dir, input_csv, method)
+        repaired.to_csv(output_path, index=False)
+
+        summaries.append(
+            RepairSummary(
+                method=method,
+                input_rows=input_rows,
+                trimmed_rows=trimmed_rows,
+                output_rows=len(repaired),
+                inserted_rows=len(repaired) - trimmed_rows,
+                original_gap_count=original_gap_count,
+                trim_before=trim_before.isoformat() if trim_before is not None else None,
+                output_path=output_path,
+            )
+        )
+
+    return summaries
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -354,34 +435,13 @@ def main() -> int:
     args = _build_parser().parse_args()
     input_csv = Path(args.input_csv)
     output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
     trim_before = _resolve_trim_before(args.trim_before)
-
-    df = _load_frame(input_csv)
-
-    summaries: List[RepairSummary] = []
-    for method in args.methods:
-        repaired, input_rows, trimmed_rows, original_gap_count = _repair(
-            df=df,
-            method=method,
-            trim_before=trim_before,
-        )
-        _validate_hourly(repaired)
-        output_path = _output_path(output_dir, input_csv, method)
-        repaired.to_csv(output_path, index=False)
-
-        summaries.append(
-            RepairSummary(
-                method=method,
-                input_rows=input_rows,
-                trimmed_rows=trimmed_rows,
-                output_rows=len(repaired),
-                inserted_rows=len(repaired) - trimmed_rows,
-                original_gap_count=original_gap_count,
-                trim_before=trim_before.isoformat() if trim_before is not None else None,
-                output_path=output_path,
-            )
-        )
+    summaries = repair_csv(
+        input_csv=input_csv,
+        output_dir=output_dir,
+        methods=args.methods,
+        trim_before=trim_before,
+    )
 
     for summary in summaries:
         print(
