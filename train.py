@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import argparse
 import json
 import random
 from dataclasses import asdict, dataclass
@@ -29,34 +28,37 @@ from utils import TensorBoardConfig, TensorBoardLogger
 
 @dataclass(frozen=True)
 class TrainConfig:
-    csv_path: str
-    output_dir: str = "outputs/test"
+    csv_path: str = "data/gap_repair/eth_metrics_midway_conservative_fill.csv"
+    output_dir: str = "outputs/ppo_eth"
 
     seed: int = 42
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    device: str = "cuda:1" if torch.cuda.is_available() else "cpu"
 
+    # Training schedule
     num_iterations: int = 200
     eval_every: int = 5
-
     deterministic_eval: bool = True
 
+    # Data pipeline
     history_days: int = 60
     sigma_days: int = 20
     multi_day_return_days: int = 7
     rows_per_day: int = 24
 
-    # Walk-forward split parameters (all in days; converted to rows internally)
+    # Expanding walk-forward split
     min_train_days: int = 365
     val_days: int = 90
     test_days: int = 90
     step_days: int = 90
 
+    # Env / reward
     alpha: float = 0.001
     lambda_risk: float = 0.1
     init_value: float = 1.0
     init_w: float = 0.0
     sigma_is_std: bool = True
 
+    # PPO trainer
     rollout_steps: int = 512
     ppo_epochs: int = 10
     minibatch_size: int = 64
@@ -66,6 +68,7 @@ class TrainConfig:
     weight_decay: float = 0.0
     max_grad_norm: float = 1.0
 
+    # PPO loss
     clip_eps: float = 0.2
     value_coef: float = 0.5
     entropy_coef: float = 0.01
@@ -73,6 +76,7 @@ class TrainConfig:
     advantage_eps: float = 1e-8
     value_loss_type: str = "mse"
 
+    # Augmentation
     p_jitter: float = 0.8
     p_feature_dropout: float = 0.5
     p_time_mask: float = 0.5
@@ -91,7 +95,7 @@ class TrainConfig:
     aug_value_coef: float = 0.25
     detach_aug_ref: bool = True
 
-    # Validation model-selection score
+    # Validation selection score
     val_reward_coef: float = 1.0
     val_mdd_coef: float = 0.25
     val_turnover_coef: float = 0.05
@@ -103,9 +107,6 @@ class TrainConfig:
     # TensorBoard
     enable_tensorboard: bool = True
     tensorboard_flush_every: int = 1
-
-
-# ── Fold generation ───────────────────────────────────────────────────────────
 
 
 @dataclass(frozen=True)
@@ -124,7 +125,6 @@ def generate_folds(
     test_days: int,
     step_days: int,
 ) -> List[Fold]:
-    """Expanding-window walk-forward folds."""
     min_train = min_train_days * rows_per_day
     val_rows = val_days * rows_per_day
     test_rows = test_days * rows_per_day
@@ -149,9 +149,6 @@ def generate_folds(
         fold_idx += 1
 
     return folds
-
-
-# ── Utilities ─────────────────────────────────────────────────────────────────
 
 
 def set_seed(seed: int) -> None:
@@ -389,9 +386,6 @@ def save_checkpoint(
     torch.save(payload, path)
 
 
-# ── Per-fold training ─────────────────────────────────────────────────────────
-
-
 def _train_one_fold(
     fold: Fold,
     df: pd.DataFrame,
@@ -401,7 +395,6 @@ def _train_one_fold(
     device: torch.device,
     tb_logger: Optional[TensorBoardLogger] = None,
 ) -> Dict[str, Any]:
-    """Train a fresh model on one walk-forward fold."""
     window_rows = cfg.history_days * cfg.rows_per_day
 
     env_cfg = TradingEnvConfig(
@@ -682,9 +675,6 @@ def _train_one_fold(
     }
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
-
-
 def run_training(cfg: TrainConfig) -> None:
     set_seed(cfg.seed)
 
@@ -776,7 +766,6 @@ def run_training(cfg: TrainConfig) -> None:
             )
             fold_summaries.append(result)
     finally:
-        # close later after run_summary logging if possible
         pass
 
     all_best_val = [r["best_val_stats"] for r in fold_summaries if r["best_val_stats"]]
@@ -835,83 +824,6 @@ def run_training(cfg: TrainConfig) -> None:
     print("=" * 80)
 
 
-def parse_args() -> TrainConfig:
-    parser = argparse.ArgumentParser(
-        description="Walk-forward PPO training for ETH hourly trading."
-    )
-    parser.add_argument(
-        "--csv_path",
-        type=str,
-        default="data/gap_repair/eth_metrics_midway_conservative_fill.csv",
-    )
-    parser.add_argument("--output_dir", type=str, default="outputs/ppo_eth")
-    parser.add_argument(
-        "--device", type=str, default=("cuda:1" if torch.cuda.is_available() else "cpu")
-    )
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--num_iterations", type=int, default=200)
-    parser.add_argument("--eval_every", type=int, default=5)
-
-    parser.add_argument("--history_days", type=int, default=60)
-    parser.add_argument("--sigma_days", type=int, default=20)
-    parser.add_argument("--multi_day_return_days", type=int, default=7)
-    parser.add_argument("--rows_per_day", type=int, default=24)
-
-    parser.add_argument("--min_train_days", type=int, default=365)
-    parser.add_argument("--val_days", type=int, default=90)
-    parser.add_argument("--test_days", type=int, default=90)
-    parser.add_argument("--step_days", type=int, default=90)
-
-    parser.add_argument("--rollout_steps", type=int, default=512)
-    parser.add_argument("--ppo_epochs", type=int, default=10)
-    parser.add_argument("--minibatch_size", type=int, default=64)
-    parser.add_argument("--learning_rate", type=float, default=3e-4)
-
-    parser.add_argument("--val_reward_coef", type=float, default=1.0)
-    parser.add_argument("--val_mdd_coef", type=float, default=0.25)
-    parser.add_argument("--val_turnover_coef", type=float, default=0.05)
-
-    parser.add_argument(
-        "--disable_tensorboard",
-        action="store_true",
-        help="Disable TensorBoard logging.",
-    )
-    parser.add_argument(
-        "--tensorboard_flush_every",
-        type=int,
-        default=1,
-        help="Flush TensorBoard writer every N logging calls.",
-    )
-
-    args = parser.parse_args()
-
-    return TrainConfig(
-        csv_path=args.csv_path,
-        output_dir=args.output_dir,
-        device=args.device,
-        seed=args.seed,
-        num_iterations=args.num_iterations,
-        eval_every=args.eval_every,
-        history_days=args.history_days,
-        sigma_days=args.sigma_days,
-        multi_day_return_days=args.multi_day_return_days,
-        rows_per_day=args.rows_per_day,
-        min_train_days=args.min_train_days,
-        val_days=args.val_days,
-        test_days=args.test_days,
-        step_days=args.step_days,
-        rollout_steps=args.rollout_steps,
-        ppo_epochs=args.ppo_epochs,
-        minibatch_size=args.minibatch_size,
-        learning_rate=args.learning_rate,
-        val_reward_coef=args.val_reward_coef,
-        val_mdd_coef=args.val_mdd_coef,
-        val_turnover_coef=args.val_turnover_coef,
-        enable_tensorboard=not args.disable_tensorboard,
-        tensorboard_flush_every=args.tensorboard_flush_every,
-    )
-
-
 if __name__ == "__main__":
-    cfg = parse_args()
+    cfg = TrainConfig()
     run_training(cfg)
